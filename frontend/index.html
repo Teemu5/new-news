@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>News Recommendations</title>
+</head>
+<body>
+  <h1>News Recommendations System</h1>
+  
+  <label for="userId">Enter User ID:</label>
+  <input type="text" id="userId" value="U8125">
+  
+  <br/><br/>
+  <label for="refDate">Reference Date (ISO format, e.g., 2019-11-11T00:00:00):</label>
+  <input type="text" id="refDate" placeholder="Optional" value="2019-11-11T00:00:00">
+  
+  <br/><br/>
+  <label for="maxCandidates">Max Candidates:</label>
+  <input type="number" id="maxCandidates" placeholder="Optional" value="-1">
+
+  <br/><br/>
+  <label for="showArticles">Fetch Articles:</label>
+  <input type="number" id="showArticles" placeholder="Optional" value="5">
+
+  <br/><br/>
+  <label for="timeframe">Time Frame (in hours):</label>
+  <input type="number" id="timeframe" placeholder="Optional" value="24">
+  
+  <div style="margin-top: 10px;">
+    <button onclick="fetchRecommendations('tfidf')">TFIDF</button>
+    <button onclick="fetchRecommendations('fastformer')">Fastformer</button>
+    <button onclick="fetchEnsembleRecommendations('bagging')">Ensemble - Bagging</button>
+    <button onclick="fetchEnsembleRecommendations('boosting')">Ensemble - Boosting</button>
+    <button onclick="fetchEnsembleRecommendations('stacking')">Ensemble - Stacking</button>
+    <button onclick="fetchEnsembleRecommendations('hybrid')">Ensemble - Hybrid</button>
+  </div>
+  
+  <ul id="recommendations" style="margin-top: 20px;"></ul>
+
+  <script>
+    function fetchRecommendations(method) {
+      const userId = document.getElementById('userId').value.trim();
+      if (!userId) {
+        alert('Please enter a valid User ID');
+        return;
+      }
+      
+      const refDate = document.getElementById('refDate').value.trim();
+      const maxCandidates = document.getElementById('maxCandidates').value.trim();
+      const timeframe = document.getElementById('timeframe').value.trim();
+      const showArticles = document.getElementById('showArticles').value.trim();
+      let queryParams = `?method=${method}`;
+      if (refDate) {
+        queryParams += `&ref_date=${encodeURIComponent(refDate)}`;
+      }
+      if (maxCandidates && maxCandidates !== "-1") {
+        queryParams += `&max_candidates=${encodeURIComponent(maxCandidates)}`;
+      }
+      if (timeframe) {
+        queryParams += `&timeframe=${encodeURIComponent(timeframe)}`;
+      }
+      if (showArticles) {
+        queryParams += `&showArticles=${encodeURIComponent(showArticles)}`;
+      }
+      
+      const url = `http://localhost:5000/recommendations/${userId}${queryParams}`;
+      fetch(url)
+        .then(response => {
+          console.log(response);
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(displayRecommendations)
+        .catch(error => {
+          console.error('Failed to load recommendations:', error);
+          document.getElementById('recommendations').textContent = 'Failed to load recommendations: ' + error.message;
+        });
+    }
+    
+    function fetchEnsembleRecommendations(ensembleMethod) {
+      const userId = document.getElementById('userId').value.trim();
+      if (!userId) {
+        alert('Please enter a valid User ID');
+        return;
+      }
+      
+      const refDate = document.getElementById('refDate').value.trim();
+      const maxCandidates = document.getElementById('maxCandidates').value.trim();
+      const timeframe = document.getElementById('timeframe').value.trim();
+      const showArticles = document.getElementById('showArticles').value.trim();
+
+      let queryParams = `?method=${ensembleMethod}`;
+      if (refDate) {
+        queryParams += `&ref_date=${encodeURIComponent(refDate)}`;
+      }
+      if (maxCandidates && maxCandidates !== "-1") {
+        queryParams += `&max_candidates=${encodeURIComponent(maxCandidates)}`;
+      }
+      if (timeframe) {
+        queryParams += `&timeframe=${encodeURIComponent(timeframe)}`;
+      }
+      if (showArticles) {
+        queryParams += `&showArticles=${encodeURIComponent(showArticles)}`;
+      }
+      
+      const url = `http://localhost:5000/recommendations/${userId}${queryParams}`;
+      fetch(url)
+        .then(response => {
+          console.log(response);
+          if (!response.ok) throw new Error('Network response was not ok');
+          return response.json();
+        })
+        .then(displayRecommendations)
+        .catch(error => {
+          console.error('Failed to load recommendations:', error);
+          document.getElementById('recommendations').textContent = 'Failed to load recommendations: ' + error.message;
+        });
+    }
+    
+    function displayRecommendations(data) {
+      const list = document.getElementById('recommendations');
+      list.innerHTML = '';
+      data.forEach(item => {
+        const li = document.createElement('li');
+        li.textContent = `${item.Title} - ${item.Abstract}`;
+        list.appendChild(li);
+      });
+    }
+  </script>
+</body>
+</html>

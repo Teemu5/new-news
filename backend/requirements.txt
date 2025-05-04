@@ -1,0 +1,24 @@
+Flask==2.0.2
+Flask-CORS==3.0.10
+numpy==1.26.4
+scikit-learn==1.5.2
+pickle-mixin==1.0.2
+Werkzeug==2.0.2
+torch==2.4.1+cu118
+transformers==4.44.2
+gnews==0.4.1
+pandas==2.2.2
+nltk==3.9.1
+datasets==2.20.0
+fastapi==0.115.12
+uvicorn==0.34.0
+pydantic==2.9.1
+tensorflow==2.18.0
+keras==3.8.0
+huggingface_hub==0.24.3
+fastparquet
+#Maybe need also:
+xgboost
+#In case running jupyter notebook scripts for manual testing
+jupyter==1.1.1
+matplotlib==3.9.2

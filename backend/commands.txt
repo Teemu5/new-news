@@ -1,0 +1,128 @@
+
+python3 train_category_models.py --dataset train --dataset_size large
+python3 train_meta_model.py --dataset train --dataset_size small --model_type category --load_best_model
+python3 train_meta_model.py --dataset train --dataset_size small --model_type category
+python3 test_recommender.py --cluster_id 0 --dataset valid
+python3 test_recommender.py --cluster_id 1 --dataset valid
+python3 test_recommender.py --cluster_id 2 --dataset valid
+python3 test_recommender.py --model_type category --dataset_size small --load_best_model --eval_scope global --dataset valid
+python3 test_recommender.py --model_type category --dataset_size small --load_best_model --eval_scope global --dataset valid --dont_resume
+python3 test_recommender.py --model_type category --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid --dont_resume
+python3 train_meta_model.py --dataset train --dataset_size small --model_type all --model_size small --load_best_model
+python3 test_recommender.py --model_type all --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid --dont_resume
+
+
+
+
+
+python3 train_category_models.py --dataset train --dataset_size large
+python3 test_recommender.py --model_type category --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid
+python3 train_meta_model.py --dataset train --dataset_size small --model_type all --model_size small --load_best_model
+python3 test_recommender.py --model_type all --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid
+python3 test_recommender.py --model_type all --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid --adaptivity_test
+
+python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --eval_scope global --dataset train --adaptivity_test
+python3 test_recommender.py --model_type all --dataset_size large --model_size large --load_best_model --eval_scope global --dataset train --adaptivity_test
+python3 train_meta_model.py --dataset train --dataset_size small --model_type all --model_size small --load_best_model
+
+python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --eval_scope global --dataset train --adaptivity_test
+python3 test_recommender.py --model_type all --dataset_size large --model_size large --load_best_model --eval_scope global --dataset train --adaptivity_test --process_dfs --process_behaviors
+python3 train_meta_model.py --dataset train --dataset_size small --model_type all --model_size small --load_best_model --retrain global
+
+python3 train_meta_model.py --dataset train --dataset_size large --model_type all --model_size large --load_best_model
+python3 test_recommender.py --model_type all --dataset_size large --model_size large --load_best_model --eval_scope global --dataset valid --adaptivity_test
+python3 test_recommender.py --model_type all --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid --adaptivity_test
+
+
+Filter empty lines:
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS.csv' --keep_donor
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS.csv'
+or python3 csv_combine_filter.py --filter_pattern 'results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS.csv'
+
+Filter  and combine:
+python3 csv_combine_filter.py --pattern1 'results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-28_23-36-39_ALL_USERS.csv' --pattern2 'results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-28_18-25-26_ALL_USERS.csv'
+python3 csv_combine_filter.py --filter_pattern '*_combined.csv'
+python3 csv_combine_filter.py --filter_pattern '*_combined.csv' --keep_donor
+
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_best_model_large_all_train_large_user_level_partial_results_2025-04-28_10-05-06_ALL_USERS.csv' --keep_donor
+
+Summary generation:
+python3 generate_summary.py --per_file --pattern 'results/filtered_*_small_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS.csv'
+or python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS_no_donor.csv'
+or python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS_keep_donor.csv'
+or python3 generate_summary.py --per_file --pattern 'results/filtered_*_small_random_best_model_small_all_valid_large_user_level_partial_results_*_ALL_USERS.csv'
+
+rm results/*_random_best_model_small_all_valid_large_user_level_partial_results_2025-04-27_15-25-19_ALL_USERS_keep_donor.csv
+
+cd 24-11-9/news/new/news/mirror/newest-version/4/2/news/backend
+
+python3 test_recommender.py --model_type category --dataset_size small --model_size small --load_best_model --eval_scope global --dataset train --adaptivity_t
+est --shuffle --drift_fraction 1 --dont_resume --eval_separate --epochs 3
+
+python3 test_recommender.py --model_type cluster --dataset_size small --model_size small --load_bes
+t_model --eval_scope global --dataset train --adaptivity_test --shuffle --drift_fraction 1 --dont_resume --eval_separate
+ --epochs 3
+
+train large global:
+python3 test_recommender.py --model_type global --dataset_size large --model_size large --load_best_model --eval_scope global --dataset train --adaptivity_test --shuffle --drift_fraction 1 --dont_resume --eval_separate --epochs 1 --retrain_models global
+
+
+base model preds on train dataset:
+python3 test_recommender.py --model_type category --dataset_size small --model_size small --load_best_model --dataset train --eval_separate --epochs 1 --batch_size 1024
+
+
+Separate model evaluation
+CLuster:
+python3 test_recommender.py --model_type cluster --dataset_size small --model_size small --load_best_model --dataset valid --eval_separate --epochs 1 
+
+Meta model train
+python3 train_meta_model.py --model_type all --dataset_size small --model_size small --dataset train --meta_model_type XGBClassifier --tree_method hist
+python3 train_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train --meta_model_type XGBClassifier --tree_method hist
+python3 train_meta_model.py --model_type category --dataset_size small --model_size small --dataset train --meta_model_type XGBClassifier --tree_method hist
+
+python3 train_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train
+Meta model eval
+python3 eval_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist
+python3 eval_meta_model.py --model_type category --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist
+
+
+
+python3 eval_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train
+
+eval separate category models:
+python3 test_recommender.py --model_type category --dataset_size small --model_size small --load_best_model --dataset valid --adaptivity_test --shuffle --drift_fraction 0.95 --dont_resume --eval_separate --epochs 1 --batch_size 2048
+
+
+python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --dataset valid --adaptivity_test --shuffle --drift_fraction 0.95 --dont_resume --epochs 1 --batch_size 2048 --skip_already_evaluated --eval_scope global
+
+[271426 rows x 6 columns][autos] 217,140 train / 54,286 val samples
+[349930 rows x 6 columns][entertainment] 279,944 train / 69,986 val samples
+[564671 rows x 6 columns][finance] 451,736 train / 112,935 val samples
+[369382 rows x 6 columns][foodanddrink] 295,505 train / 73,877 val samples
+[304088 rows x 6 columns][health] 243,270 train / 60,818 val samples
+[162 rows x 6 columns][kids] 129 train / 33 val samples
+[655440 rows x 6 columns][lifestyle] 524,352 train / 131,088 val samples
+[132091 rows x 6 columns][movies] 105,672 train / 26,419 val samples
+[269008 rows x 6 columns][music] 215,206 train / 53,802 val samples
+[1591038 rows x 6 columns][news] 1,272,830 train / 318,208 val samples
+[29 rows x 6 columns][northamerica] 23 train / 6 val samples
+[592226 rows x 6 columns][sports] 473,780 train / 118,446 val samples
+[315101 rows x 6 columns][travel] 252,080 train / 63,021 val samples
+[246462 rows x 6 columns][tv] 197,169 train / 49,293 val samples
+[93744 rows x 6 columns][video] 74,995 train / 18,749 val samples
+[88646 rows x 6 columns][weather] 70,916 train / 17,730 val samples
+
+   NewsID   Category  ...                                      TitleEntities                                   AbstractEntities
+0  N88753  lifestyle  ...  [{"Label": "Prince Philip, Duke of Edinburgh",...                                                 []
+1  N23144     health  ...  [{"Label": "Adipose tissue", "Type": "C", "Wik...  [{"Label": "Adipose tissue", "Type": "C", "Wik...
+2  N86255     health  ...  [{"Label": "Drug Enforcement Administration", ...                                                 []
+3  N93187       news  ...                                                 []  [{"Label": "Ukraine", "Type": "G", "WikidataId...
+4  N75236     health  ...                                                 []  [{"Label": "National Basketball Association", ...
+
+Loaded behaviors data:
+   ImpressionID   UserID  ...                                        HistoryText                                        Impressions
+0             1   U87243  ...  N8668 N39081 N65259 N79529 N73408 N43615 N2937...  N78206-0 N26368-0 N7578-0 N58592-0 N19858-0 N5...
+1             2  U598644  ...  N56056 N8726 N70353 N67998 N83823 N111108 N107...  N47996-0 N82719-0 N117066-0 N8491-0 N123784-0 ...
+2             3  U532401  ...  N128643 N87446 N122948 N9375 N82348 N129412 N5...              N103852-0 N53474-0 N127836-0 N47925-1
+3             4  U593596  ...  N31043 N39592 N4104 N8223 N114581 N92747 N1207...  N38902-0 N76434-0 N71593-0 N100073-0 N108736-0...
+4             5  U239687  ...  N65250 N122359 N71723 N53796 N41663 N41484 N11...  N76209-0 N48841-0 N67937-0 N62235-0 N6307-0 N3...
