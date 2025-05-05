@@ -16,9 +16,8 @@ pydantic==2.9.1
 tensorflow==2.18.0
 keras==3.8.0
 huggingface_hub==0.24.3
-fastparquet
-#Maybe need also:
-xgboost
+fastparquet==2024.11.0
+xgboost==3.0.0
 #In case running jupyter notebook scripts for manual testing
 jupyter==1.1.1
 matplotlib==3.9.2

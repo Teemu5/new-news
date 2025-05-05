@@ -803,12 +803,14 @@ def precompute_candidate_pool(behaviors_df, cutoff_dt):
     candidate_pool = [art for art, t in first_interactions.items() if t <= cutoff_dt]
     return candidate_pool
 
-def get_candidate_pool_for_user(user_id, behaviors_df, news_df, cutoff_time_str, cutoff, user_history_ids):
+def get_candidate_pool_for_user(user_id, behaviors_df, news_df, cutoff_time_str, cutoff, user_history_ids, remove_history=False):
     global CANDIDATE_POOL_CACHE
     if cutoff_time_str not in CANDIDATE_POOL_CACHE:
         CANDIDATE_POOL_CACHE[cutoff_time_str] = precompute_candidate_pool(behaviors_df, cutoff)
     candidate_pool = CANDIDATE_POOL_CACHE[cutoff_time_str]
-    candidate_pool_user = list(set(candidate_pool) - set(user_history_ids))
+    candidate_pool_user = list(set(candidate_pool))
+    if remove_history:
+        candidate_pool_user = list(set(candidate_pool) - set(user_history_ids))
     return candidate_pool_user
 
 def user_candidate_generation(
@@ -1819,12 +1821,11 @@ def prepare_train_df(
     for cluster, data in clustered_data_balanced.items():
         print(f"Cluster {cluster}: {len(data)} samples")
     """
-    # Optionally perform random sampling
+    # Random sampling:
     print(f"Original size: {len(train_df)}")
     train_df_sampled = train_df.sample(frac=fraction, random_state=42)
     print(f"Sampled size: {len(train_df_sampled)}")
 
-    # Optionally, set train_df to sampled
     train_df = train_df_sampled
     print("Columns in sampled train_df:")
     print(train_df.columns)
@@ -2258,11 +2259,14 @@ def build_and_load_weights(weights_file):
      model.load_weights(weights_file)
      return model
 
-def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters, batch_size=64, epochs=5, load_models=[], retrain=False, size='large'):
+def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters, batch_size=64, epochs=5, load_models=[], retrain=False, size='large', train_part=0.8, model_base=''):
     models = {}
     model_dir = "models"    
     for cluster in range(num_clusters):
-        m_name = f'fastformer_cluster_{cluster}_{size}_full_balanced_1_epoch'
+        if model_base == '':
+            m_name = f'fastformer_cluster_{cluster}_{size}_full_balanced_1_epoch'
+        else:
+            m_name = f'fastformer_cluster_{cluster}_{model_base}'
         weights_file = f'{model_dir}/{m_name}.weights.h5'
         model_file = f'{model_dir}/{m_name}.keras'
         model_h5_file = f'{model_dir}/{m_name}.h5'
@@ -2287,7 +2291,6 @@ def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_leng
             #print(f"Saved model for Cluster {cluster} into {model_file}.")
             continue
         
-        model_file = f"{model_dir}/{model_file}"
         print(f"\nTraining model for Cluster {cluster} into {weights_file}")
         # Retrieve training and validation data
         train_data = clustered_data[cluster]['train']
@@ -2397,7 +2400,7 @@ def resume_or_build_h5(model_dir, build_fn, steps_per_epoch):
     return model, start_epoch
 
 def train_global_model(
-    train_df,
+    train_data,
     tokenizer,
     vocab_size,
     max_history_length,
@@ -2405,10 +2408,15 @@ def train_global_model(
     dataset_size,
     batch_size=128,
     epochs=5,
+    val_data=None,
     retrain=False,
     load_best_model=False,
-    load_checkpoint_model=False
+    load_checkpoint_model=False, model_base=''
 ):
+    if model_base == '':
+        model_file_prefix=f"fastformer_global_{dataset_size}_balanced_{epochs}_epochs"
+    else:
+        model_file_prefix = f'fastformer_global_{model_base}'
     model_file_prefix=f"fastformer_global_{dataset_size}_balanced_{epochs}_epochs"
     model_dir="models"
     weights_file = f'{model_dir}/{model_file_prefix}.weights.h5'
@@ -2425,10 +2433,11 @@ def train_global_model(
         model = load(load_file)
         print(f"Loaded existing global model from {keras_file}")
         return model
-    train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
+    #train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
 
     train_generator = DataGenerator(train_data, batch_size=batch_size, max_history_length=max_history_length, max_title_length=max_title_length)
-    val_generator = DataGenerator(val_data, batch_size=batch_size, max_history_length=max_history_length, max_title_length=max_title_length)
+    #if val_data:
+    #    val_generator = DataGenerator(val_data, batch_size=batch_size, max_history_length=max_history_length, max_title_length=max_title_length)
     steps_per_epoch = len(train_generator)
 
     model, start_epoch = resume_or_build_h5(
@@ -2477,7 +2486,7 @@ def train_global_model(
         epochs=epochs,
         initial_epoch=start_epoch,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_generator,
+        #validation_data=val_generator,
         callbacks=[early_stopping, csv_logger, model_checkpoint, save_every_n],
         class_weight=class_weight
     )
@@ -2626,18 +2635,23 @@ def load(load_this, custom_objects=None, max_history_length=50, max_title_length
     logging.info(f"Model Loaded {load_this}")
     return model
 
-def train_category_models(category_train_dfs, vocab_size, max_history_length, max_title_length, batch_size=64, epochs=5, dataset_size='', train_only_new=True, train_fraction=1.0, load_best_model=True):
+def train_category_models(category_train_dfs, vocab_size, max_history_length, max_title_length, batch_size=64, epochs=5, dataset_size='',
+    train_only_new=True, train_fraction=1.0, load_best_model=True, model_base=''):
     #Train a model for each category in the category_train_dfs dict.
     model_dir = "models"
     category_models = {}
     for category, df in category_train_dfs.items():
+        if model_base == '':
+            model_file_prefix=f"fastformer_{model_size}_category_{category}_{epochs}epochs"
+        else:
+            model_file_prefix = f'fastformer_category_{category}_{model_base}'
         print(f"Training {category.upper()}")
         print(df)
         train_df, val_df = df["train"], df["val"]
-        keras_model_save_path = f'{model_dir}/fastformer_{dataset_size}_category_{category}_{epochs}epochs.keras'
-        model_save_path = f'{model_dir}/fastformer_{dataset_size}_category_{category}_{epochs}epochs.h5'
-        best_model = f'{model_dir}/best_model_fastformer_{dataset_size}_category_{category}_{epochs}epochs.h5'
-        keras_best_model = f'{model_dir}/fastformer_{dataset_size}_category_{category}_{epochs}epochs.keras'
+        keras_model_save_path = f'{model_dir}/{model_file_prefix}.keras'
+        model_save_path = f'{model_dir}/{model_file_prefix}.h5'
+        best_model = f'{model_dir}/best_model_{model_file_prefix}.h5'
+        keras_best_model = f'{model_dir}/{model_file_prefix}.keras'
         if train_only_new and os.path.exists(model_save_path):
             if load_best_model:
                 category_models[category] = load(best_model)
@@ -2651,7 +2665,9 @@ def train_category_models(category_train_dfs, vocab_size, max_history_length, ma
         #        print(f"enable memory growth on gpu: {gpu}")
         #        tf.config.experimental.set_memory_growth(gpu, True)
         # Split into train/validation sets
-        train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
+        #train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
+        train_data = train_df
+        val_data = val_df
         print(f"Category '{category}': {len(train_data)} training samples, {len(val_data)} validation samples.")
 
         train_generator = DataGenerator(train_data, batch_size=batch_size, max_history_length=max_history_length, max_title_length=max_title_length)
@@ -2689,39 +2705,62 @@ def train_category_models(category_train_dfs, vocab_size, max_history_length, ma
 
 def is_colab():
     return 'COLAB_GPU' in os.environ
-def make_clustered_data(train_df, num_clusters, test_size=0.2, random_state=42):
+def make_clustered_data(train_df, num_clusters, test_size=0.2, random_state=42, split_indepently=False):
     clustered_data = {}
+    
+    total_train_data, total_val_data = train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
     for cluster in range(num_clusters):
-        cluster_data = train_df[train_df['Cluster'] == cluster]
-
-        if cluster_data.empty:
-            print(f"No data for Cluster {cluster}. Skipping...")
-            continue
-
-        train_data, val_data = train_test_split(cluster_data, test_size=test_size, random_state=random_state, stratify=None)
-        clustered_data[cluster] = {
-            'train': train_data.reset_index(drop=True),
-            'val': val_data.reset_index(drop=True)
-        }
+        if split_indepently:
+            cluster_data = train_df[train_df['Cluster'] == cluster]
+            if cluster_data.empty:
+                print(f"No data for Cluster {cluster}.")
+                continue
+            train_data, val_data = train_test_split(cluster_data, test_size=test_size, random_state=random_state, stratify=None)
+            clustered_data[cluster] = {
+                'train': train_data.reset_index(drop=True),
+                'val': val_data.reset_index(drop=True)
+            }
+        else:
+            train_data = total_train_data[total_train_data['Cluster'] == cluster]
+            val_data = total_val_data[total_val_data['Cluster'] == cluster]
+            if train_data.empty:
+                print(f"No data for Cluster {cluster}.")
+                continue
+            clustered_data[cluster] = {
+                'train': train_data.reset_index(drop=True)
+            }
+            clustered_data[cluster]['val'] = val_data.reset_index(drop=True)
         print(f"Cluster {cluster}: {len(train_data)} training samples, {len(val_data)} validation samples.")
     return clustered_data
 
-def make_category_data(train_df, test_size=0.2, random_state=42):
+def make_category_data(train_df, test_size=0.2, random_state=42, split_indepently=False):
     # Returns a dict like {'Sports': {'train': …, 'val': …}, …}
     category_data = {}
-    for cat, cat_df in train_df.groupby("CandidateCategory"):
-        print(f"cat:{cat}, cat_df:{cat_df}")
-        if cat_df.empty:
-            continue
-        tr, val = train_test_split(cat_df,
-                                   test_size=test_size,
-                                   random_state=random_state,
-                                   stratify=None)
-        category_data[cat] = {
-            "train": tr.reset_index(drop=True),
-            "val":   val.reset_index(drop=True)
-        }
-        print(f"[{cat}] {len(tr):,} train / {len(val):,} val samples")
+    if split_indepently:
+        for cat, cat_df in train_df.groupby("CandidateCategory"):
+            print(f"cat:{cat}, cat_df:{cat_df}")
+            if cat_df.empty:
+                continue
+            tr, val = train_test_split(cat_df, test_size=test_size, random_state=random_state, stratify=None)
+            category_data[cat] = {
+                "train": tr.reset_index(drop=True),
+                "val":   val.reset_index(drop=True)
+            }
+            print(f"[{cat}] {len(tr):,} train / {len(val):,} val samples")
+    else:
+        tr, val = train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
+        for cat, cat_df in tr.groupby("CandidateCategory"):
+            print(f"cat:{cat}, cat_df:{cat_df}")
+            if cat_df.empty:
+                continue
+            category_data[cat] = {
+                "train": tr.reset_index(drop=True)
+            }
+        for cat, cat_df in val.groupby("CandidateCategory"):
+            print(f"cat:{cat}, cat_df:{cat_df}")
+            if cat_df.empty:
+                continue
+            category_data[cat]["val"] = val.reset_index(drop=True)
     return category_data
 
 def make_user_cluster_df(user_category_profiles_path = 'user_category_profiles.pkl', user_cluster_df_path = 'user_cluster_df.pkl'):
@@ -2767,10 +2806,13 @@ def load_dataset(data_dir, news_file='news.tsv', behaviors_file='behaviors.tsv')
 
 def get_midpoint_time(behaviors_df):
     behaviors_df['Time'] = pd.to_datetime(behaviors_df['Time'], errors='coerce')
+    log_print(f"Computing Midpoint time for behaviors_df: {behaviors_df}")
     min_time = behaviors_df['Time'].min()
     max_time = behaviors_df['Time'].max()
     midpoint = min_time + (max_time - min_time) / 2
-    print(f"Midpoint time computed: {midpoint}")
+    log_print(f"min_time time: {min_time}")
+    log_print(f"max_time time: {max_time}")
+    log_print(f"Midpoint time computed: {midpoint}")
     return midpoint
 
 def init_dataset(data_dir, news_file='news.tsv', behaviors_file='behaviors.tsv'):
@@ -3095,14 +3137,19 @@ def get_class_weights(labels):
     weights = compute_class_weight('balanced', classes=classes, y=labels)
     return dict(zip(classes, weights))
 
-def load_category_models(category_train_dfs, dataset_size='large', model_size='large', epochs=3, load_best_model=True, tokenizer=None, max_history_length=50, max_title_length=30, train_new=False, batch_size=256):
+def load_category_models(category_train_dfs, dataset_size='large', model_size='large', epochs=3, load_best_model=True, tokenizer=None,
+    max_history_length=50, max_title_length=30, train_new=False, batch_size=256, model_base=''):
     model_dir = "models"
     category_models = {}
     for category, df in category_train_dfs.items():
-        keras_model_save_path = f'{model_dir}/fastformer_{model_size}_category_{category}_{epochs}epochs.keras'
-        model_save_path = f'{model_dir}/fastformer_{model_size}_category_{category}_{epochs}epochs.h5'
-        best_model = f'{model_dir}/best_model_fastformer_{model_size}_category_{category}_{epochs}epochs.h5'
-        keras_best_model = f'{model_dir}/fastformer_{model_size}_category_{category}_{epochs}epochs.keras'
+        if model_base == '':
+            model_file_prefix=f"fastformer_{model_size}_category_{category}_{epochs}epochs"
+        else:
+            model_file_prefix = f'fastformer_category_{category}_{model_base}'
+        keras_model_save_path = f'{model_dir}/{model_file_prefix}.keras'
+        model_save_path = f'{model_dir}/{model_file_prefix}.h5'
+        best_model = f'{model_dir}/best_model_{model_file_prefix}.h5'
+        keras_best_model = f'{model_dir}/{model_file_prefix}.keras'
         if load_best_model and os.path.exists(best_model):
             category_models[f"{category}_{model_size}"] = load(best_model)
         elif not load_best_model and os.path.exists(model_save_path):
@@ -3110,7 +3157,8 @@ def load_category_models(category_train_dfs, dataset_size='large', model_size='l
         
     if category_models == {} or train_new:
         vocab_size = len(tokenizer.word_index) + 1
-        category_models = train_category_models(category_train_dfs, vocab_size, max_history_length, max_title_length, batch_size=batch_size, epochs=epochs, dataset_size=dataset_size, train_only_new=False, train_fraction=0.9, load_best_model=True)
+        category_models = train_category_models(category_train_dfs, vocab_size, max_history_length, max_title_length, batch_size=batch_size, epochs=epochs, dataset_size=dataset_size,
+            train_only_new=False, train_fraction=0.9, load_best_model=True, model_base=model_base)
     return category_models
 
 def log_print(s):
@@ -3119,22 +3167,33 @@ def log_print(s):
 
 def get_models(process_dfs = False, process_behaviors = False, data_dir = 'dataset/train/', valid_data_dir = 'dataset/valid/', zip_file = f"MINDlarge_train.zip", valid_zip_file = f"MINDlarge_dev.zip",
     model_type='cluster', dataset_size='large', model_size='large', load_best_model=False, load_best_models=[], epochs=1, retrain_models = [], evaluate=False, skip_already_evaluated=False, dataset_fraction=1.0,
-    dataset='train', batch_size=256, eval_dataset_size='large'):
+    dataset='train', batch_size=256, eval_dataset_size='large', cutoff_time_str=None, eval_full=False, test_size=0.0, use_model_base=False):
     news_file = 'news.tsv'
     behaviors_file = 'behaviors.tsv'
-    if "small" in data_dir:
-        news_df_pkl = "models/small_news_df_processed"
-        train_df_pkl = "models/small_train_df_processed"
-    else:
-        news_df_pkl = "models/news_df_processed"
-        train_df_pkl = "models/train_df_processed"
+    small_news_df_pkl = "models/small_news_df_processed"
+    small_train_df_pkl = "models/small_train_df_processed"
+    news_df_pkl = "models/news_df_processed"
+    train_df_pkl = "models/train_df_processed"
     categorized_samples = False
     if model_type == 'category' or model_type == 'all':
+        small_news_df_pkl = f"{small_news_df_pkl}_categorized"
+        small_train_df_pkl = f"{small_train_df_pkl}_categorized"
         news_df_pkl = f"{news_df_pkl}_categorized"
         train_df_pkl = f"{train_df_pkl}_categorized"
         categorized_samples = True
-    news_df_pkl = f"{news_df_pkl}.pkl"
-    train_df_pkl = f"{train_df_pkl}.pkl"
+    small_news_df_pkl = f"{small_news_df_pkl}.pkl"
+    small_train_df_pkl = f"{small_train_df_pkl}.pkl"
+    if "small" in data_dir:
+        news_df_pkl = small_news_df_pkl
+        train_df_pkl = small_train_df_pkl
+    else:
+        news_df_pkl = f"{news_df_pkl}.pkl"
+        train_df_pkl = f"{train_df_pkl}.pkl"
+    if not os.path.exists(train_df_pkl):
+        log_print(f"\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!")
+        news_df_pkl = small_news_df_pkl
+        train_df_pkl = small_train_df_pkl
+
     data_dir, vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters, category_data = init(process_dfs, process_behaviors, data_dir, valid_data_dir, zip_file, valid_zip_file,
     train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples)
     if process_dfs:
@@ -3149,7 +3208,18 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
             max_history_length=50,
             train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples
         )
+    if test_size > 0.0:
+        train_data, test_data = train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
+        category_data = make_category_data(train_df, test_size=test_size, random_state=42)
+    else:
+        train_data = train_df
+        test_data = None
     quick_compare(behaviors_df, train_df)
+    model_base = ''
+    if use_model_base:
+        model_base = f"{model_size}_full_balanced_{epochs}_epoch"
+        if test_size > 0.0:
+            model_base = f"{model_size}_train_size_{1-test_size}_balanced_{epochs}_epoch"
     if model_type == 'cluster' or model_type == 'all':
         cluster_models = train_cluster_models(
             clustered_data=clustered_data,
@@ -3159,13 +3229,15 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
             max_title_length=max_title_length,
             num_clusters=num_clusters,
             batch_size=batch_size,
-            epochs=1,
+            epochs=epochs,
             size=model_size,
-            retrain='cluster' in retrain_models
+            retrain='cluster' in retrain_models,
+            model_base=model_base
         )
         logging.info(f"loaded total cluster_models:{cluster_models}")
     if model_type == 'global' or model_type == 'all':
-        global_model = train_global_model(train_df, tokenizer, vocab_size, max_history_length, max_title_length, dataset_size=model_size, batch_size=batch_size, epochs=epochs, retrain='global' in retrain_models, load_best_model='global' in load_best_models)
+        global_model = train_global_model(train_data, tokenizer, vocab_size, max_history_length, max_title_length, val_data=test_data, dataset_size=model_size, batch_size=batch_size, epochs=epochs,
+        retrain='global' in retrain_models, load_best_model='global' in load_best_models, model_base=model_base)
         global_models = {}
         global_models[f"global_{model_size}"] = global_model
         logging.info(f"loaded total global_models:{global_models}")
@@ -3173,7 +3245,7 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
         #category_train_dfs, news_df, behaviors_df, tokenizer = prepare_category_train_dfs(data_dir, news_file, behaviors_file, 30, 50, f"category_train_dfs_{dataset_size}.pkl")
         category_train_dfs = train_df
         category_models = load_category_models(category_data, dataset_size=dataset_size, model_size=model_size, load_best_model=load_best_model or 'category' in load_best_models,
-        epochs=epochs, tokenizer=tokenizer, train_new='category' in retrain_models, batch_size=batch_size)
+        epochs=epochs, tokenizer=tokenizer, train_new='category' in retrain_models, batch_size=batch_size, model_base=model_base)
     if model_type == "cluster":
         models = cluster_models
     elif model_type == "category":
@@ -3187,15 +3259,23 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
     if evaluate:
         out_dir = Path("base_preds")
         out_dir.mkdir(exist_ok=True)
+        test_data = train_df
+        if not eval_full:
+            if test_size > 0.0:
+                train_data, test_data = train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
+            #train_data, test_data = train_test_split_time(train_df, cutoff_time_str)
+        else:
+            test_size=1.0
         for key, model in models.items():
-            store_path = out_dir / f"{key}_{dataset}_{dataset_size}.parquet"
-            store_metrics_path = out_dir / f"{key}_{dataset}_{dataset_size}_metrics.json"
+            store_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}.parquet"
+            store_metrics_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}_metrics.json"
             if skip_already_evaluated and store_path.exists() and store_path.stat().st_size > 0:
                 log_print(f"Skipping evaluation for {key}: {store_path}")
                 continue
+            log_print(f"evaluation with key:{key}, model:{model}, {store_path}:{store_path}, store_metrics_path:{store_metrics_path}")
             res = evaluate_with_generator(
                 model,
-                eval_df=train_df,
+                eval_df=test_data,
                 batch_size=batch_size,
                 store_path=store_path,
                 flush_every=0.10,
@@ -3221,7 +3301,8 @@ def train_meta_from_parquet(
         class_weight  = "balanced",
         meta_model_type = 'LogisticRegression',
         booster = 'default',
-        tree_method = 'default'):
+        tree_method = 'default',
+        n_estimators = 300):
 
     files = sorted(Path(parquet_dir).glob(pattern))
     if base_model_type == "cluster":
@@ -3354,6 +3435,13 @@ def train_meta_from_parquet(
 
     return meta
 
+def gpu_predict_in_batches(model, X, batch=200000):
+    out = []
+    for start in range(0, X.shape[0], batch):
+        part = X[start:start+batch]
+        out.append(model.predict_proba(part)[:, 1])
+    return np.concatenate(out)
+
 def evaluate_meta_from_parquet(meta_path: str,
                                 parquet_dir: str = "base_preds",
                                 pattern: str = "*.parquet",
@@ -3361,8 +3449,9 @@ def evaluate_meta_from_parquet(meta_path: str,
                                 store_parquet_path="preds.parquet",
                                 store_metrics_path="metrics.json",
                                 verbose: bool = True,
-                                booster='default'):
-
+                                booster='default',
+                                batches=True):
+    print(f"loading meta model from {meta_path}")
     meta = joblib.load(meta_path)
     if 'XGBClassifier' in meta_path:
         print(f"meta model .feature_importances_:{meta.feature_importances_}")
@@ -3402,7 +3491,11 @@ def evaluate_meta_from_parquet(meta_path: str,
     X      = merged[featcols].to_numpy(dtype="float32")
     y_true = merged["y_true"].to_numpy(dtype="int8")
 
-    y_pred = meta.predict_proba(X)[:, 1]
+    if batches:
+        y_pred = gpu_predict_in_batches(meta, X, batch=200000)
+    else:
+        y_pred = meta.predict_proba(X)[:, 1]
+
     merged["y_pred"] = y_pred.astype("float32")
 
     auc  = roc_auc_score(y_true, y_pred)
@@ -3686,10 +3779,11 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
         zip_file_train="MINDlarge_train.zip", zip_file_valid="MINDlarge_dev.zip",
         user_category_profiles_path='', user_cluster_df_path='', cluster_id=None, meta_train=False,resume=True,
         model_type="cluster", dataset_size='large', load_best_model=False, load_best_models=[], eval_scope='cluster', model_size='large', epochs=1,
-        adaptivity_test=False, donor_strategy='random', shuffle=False, drift_fraction=0.5, use_full_set=True, eval_separate=False,
+        adaptivity_test=False, donor_strategy='random', shuffle=False, drift_fraction=0.5, use_full_set=True, eval_separate=False, use_full_eval_separate_set=False,
         skip_already_evaluated=False, batch_size=256, retrain_models=[], eval_dataset_size='large',
         ext_data_dir_train='dataset/train/', ext_data_dir_valid='dataset/valid/',
-        ext_zip_file_train="MINDlarge_train.zip", ext_zip_file_valid="MINDlarge_dev.zip",):
+        ext_zip_file_train="MINDlarge_train.zip", ext_zip_file_valid="MINDlarge_dev.zip",n_estimators=300, test_size=0.2, end_after_process=False,
+        use_model_base=False, valid_dataset_size='large'):
     # Main function to run tests on a given dataset type ('train' or 'valid').
     # It uses the midpoint time as cutoff and then runs evaluations.
     # Choose dataset directory based on parameter.
@@ -3717,8 +3811,10 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
     max_title_length = 30
 
     midpoint_time = get_midpoint_time(behaviors_df)
+    ext_midpoint_time = get_midpoint_time(ext_behaviors_df)
     # Format the time to ISO format with a trailing 'Z'
-    cutoff_time_str = midpoint_time.isoformat().replace('+00:00', 'Z')
+    #cutoff_time_str = midpoint_time.isoformat().replace('+00:00', 'Z')
+    cutoff_time_str = ext_midpoint_time.isoformat().replace('+00:00', 'Z')
     print("Using cutoff time:", cutoff_time_str)
 
     tfidf_vectorizer = TfidfVectorizer()
@@ -3738,12 +3834,16 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
 
     if model_type == "cluster":
         models_dict, news_df, behaviors_df, tokenizer = get_models(process_dfs, process_behaviors, data_dir_train, data_dir_valid, zip_file_train, zip_file_valid, evaluate=eval_separate, dataset=dataset,
-        skip_already_evaluated=skip_already_evaluated, model_size=model_size, batch_size=batch_size, retrain_models=retrain_models, dataset_size=dataset_size)
+        skip_already_evaluated=skip_already_evaluated, model_size=model_size, batch_size=batch_size, retrain_models=retrain_models, dataset_size=dataset_size, test_data=test_data,
+        cutoff_time_str=cutoff_time_str, eval_full=use_full_eval_separate_set, test_size=test_size, use_model_base=use_model_base)
     if model_type == "category" or model_type == "all" or model_type == "global":
         models_dict, news_df, behaviors_df, tokenizer = get_models(process_dfs, process_behaviors, data_dir_train, data_dir_valid, zip_file_train, zip_file_valid, model_type=model_type, dataset_size=dataset_size,
         model_size=model_size, load_best_model=load_best_model, load_best_models=load_best_models, epochs=epochs, evaluate=eval_separate, dataset=dataset,
-        skip_already_evaluated=skip_already_evaluated, batch_size=batch_size, retrain_models=retrain_models)
-
+        skip_already_evaluated=skip_already_evaluated, batch_size=batch_size, retrain_models=retrain_models, cutoff_time_str=cutoff_time_str, eval_full=use_full_eval_separate_set, test_size=test_size,
+        use_model_base=use_model_base)
+    if end_after_process:
+        log_print(f"ending after preprocessing")
+        return
     print(f"get_models give badd behaviors_df!!")
     print(f"behaviors_df:{behaviors_df}")
     news_df, behaviors_df = init_dataset(data_dir)
@@ -3771,9 +3871,12 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
     if eval_scope == "global":
         cluster_mapping = {"ALL_USERS": all_users}
 
-    meta_name = 'XGBClassifier_hist'
+    meta_name = f"XGBClassifier_hist_{n_estimators}"
     meta_model_base = f"meta_model_{meta_name}_{model_type}_{model_size}_train_{dataset_size}"
     meta_model_base_pattern = f"meta_model_{meta_name}_*_{model_size}_train_{dataset_size}"
+    if test_size >= 0.0:
+        meta_model_base = f"meta_model_{meta_name}_{model_type}_{model_size}_train_{dataset_size}_test_size_{test_size}"
+        meta_model_base_pattern = f"meta_model_{meta_name}_*_{model_size}_train_{dataset_size}_test_size_{test_size}"
     if eval_dataset_size != dataset_size:
         log_print(f"!!! eval_dataset_size != dataset_size !!! eval_dataset_size:{eval_dataset_size} and dataset_size:{dataset_size}")
         log_print(f"!!! eval_dataset_size != dataset_size !!! eval_dataset_size:{eval_dataset_size} and dataset_size:{dataset_size}")
@@ -3835,6 +3938,7 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
     #meta_model_XGBClassifier_hist_cluster_small_train_small
     meta_model_path = f"meta/{meta_model_base}.joblib"
     meta_model_pattern = f"meta/{meta_model_base_pattern}.joblib"
+
 
     #all_users = [u for users in cluster_mapping.values() for u in users if u != user_id]
     viable_donors_file = f"viable_donors_full_large_{cutoff_time_str}.pkl"

@@ -80,12 +80,22 @@ python3 train_meta_model.py --model_type all --dataset_size small --model_size s
 python3 train_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train --meta_model_type XGBClassifier --tree_method hist
 python3 train_meta_model.py --model_type category --dataset_size small --model_size small --dataset train --meta_model_type XGBClassifier --tree_method hist
 
+
+
 python3 train_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train
 Meta model eval
+python3 eval_meta_model.py --model_type category --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+python3 eval_meta_model.py --model_type all --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+python3 eval_meta_model.py --model_type category --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+
+on large:
+python3 eval_meta_model.py --model_type category --dataset_size large --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+python3 eval_meta_model.py --model_type all --dataset_size large --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+python3 eval_meta_model.py --model_type category --dataset_size large --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist --n_estimators 300 --test_size 0.2
+
+
 python3 eval_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist
 python3 eval_meta_model.py --model_type category --dataset_size small --model_size small --dataset valid --meta_model_type XGBClassifier --tree_method hist
-
-
 
 python3 eval_meta_model.py --model_type cluster --dataset_size small --model_size small --dataset train
 
@@ -94,6 +104,22 @@ python3 test_recommender.py --model_type category --dataset_size small --model_s
 
 
 python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --dataset valid --adaptivity_test --shuffle --drift_fraction 0.95 --dont_resume --epochs 1 --batch_size 2048 --skip_already_evaluated --eval_scope global
+
+running evaluation for 0.2 small dataset is 4566 batches taking 7:10
+
+
+
+
+TRAINING MODELS WITH COMMAND:
+python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --eval_scope global --dataset train --adaptivity_test --shuffle --drift_fraction 0.90 --dont_resume --epochs 1 --eval_separate --use_model_base
+SMALL DATA SET IS SPLIT TO 0.8 TRAIN SET AND 0.2 VALIDATION SET!
+
+ONCE MODELS ARE TRAINED THEN THEY ARE VALIDATED WITH THE SMALLER VALIDATION SET. NEXT META MODEL IS TRAINED ON THESE PREDS MADE ON THE VALIDATION PART!
+THEN BOTH BASE MODELS AND META MODELS CAN BE EVALUATED ON THE SEPARATE MIND VALIDATION SET! 
+
+
+
+
 
 [271426 rows x 6 columns][autos] 217,140 train / 54,286 val samples
 [349930 rows x 6 columns][entertainment] 279,944 train / 69,986 val samples
@@ -126,3 +152,19 @@ Loaded behaviors data:
 2             3  U532401  ...  N128643 N87446 N122948 N9375 N82348 N129412 N5...              N103852-0 N53474-0 N127836-0 N47925-1
 3             4  U593596  ...  N31043 N39592 N4104 N8223 N114581 N92747 N1207...  N38902-0 N76434-0 N71593-0 N100073-0 N108736-0...
 4             5  U239687  ...  N65250 N122359 N71723 N53796 N41663 N41484 N11...  N76209-0 N48841-0 N67937-0 N62235-0 N6307-0 N3...
+
+
+
+
+
+Summary gen:
+
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_1.0_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_15-26-29_ALL_USERS.csv' --keep_donor
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_1.0_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_15-26-29_ALL_USERS.csv'
+python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_1.0_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_15-26-29_ALL_USERS_no_donor.csv' --auc
+python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_1.0_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_15-26-29_ALL_USERS_keep_donor.csv' --auc
+
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS.csv' --keep_donor
+python3 csv_combine_filter.py --filter_pattern 'results/*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS.csv'
+python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS_no_donor.csv' --auc
+python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS_keep_donor.csv' --auc

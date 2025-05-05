@@ -1,4 +1,4 @@
-from model_utils import main, run_meta_training, train_meta_from_parquet
+from model_utils import main, train_meta_from_parquet
 import argparse, pathlib
 
 if __name__ == "__main__":
@@ -15,13 +15,14 @@ if __name__ == "__main__":
     parser.add_argument("--process_behaviors", action='store_true', help="Process behaviors if needed")
     parser.add_argument("--retrain", type=str, default="none", help="comma separate list of model types to retrain")
     parser.add_argument("--epochs", type=int, default=1, help="epochs number of (global) model to train/load")
-    parser.add_argument("--meta_model_type", type=str, default="LogisticRegressionCV", help="meta model type LogisticRegression, LogisticRegressionCV or SGDClassifier")
+    parser.add_argument("--meta_model_type", type=str, default="XGBClassifier", help="meta model type LogisticRegression, LogisticRegressionCV, XGBClassifier or SGDClassifier")
     parser.add_argument("--booster", type=str, default="default", help="booster for XGBClassifier")
-    parser.add_argument("--tree_method", type=str, default="default", help="tree_method for XGBClassifier")
-
+    parser.add_argument("--tree_method", type=str, default="hist", help="tree_method for XGBClassifier")
+    parser.add_argument("--n_estimators", type=int, default=300, help="n_estimators for XGBClassifier")
 
     parser.add_argument("--parquet_dir", type=str, default="base_preds", help="parquet_dir for base preds")
     parser.add_argument("--estimator", type=str, default="lbfgs", help="estimator for meta model")
+    parser.add_argument("--test_size", type=float, default=-0.1, help="test_size which validation scores meta model is trained on. Ignored when given negative value")
 
     args = parser.parse_args()
     if args.dataset_size == "small":
@@ -44,13 +45,16 @@ if __name__ == "__main__":
         retrain_models = args.retrain.split(',')
     else:
         retrain_models = []
-    pattern = f"*_{args.model_size}_{args.dataset}_{args.dataset_size}.parquet"
     meta_name = args.meta_model_type
-    if args.tree_method != 'default':
+    if args.tree_method != '':
         meta_name = f"{meta_name}_{args.tree_method}"
     if args.booster != 'default':
         meta_name = f"{meta_name}_{args.booster}"
-    meta_model_base = f"meta_model_{meta_name}_{args.model_type}_{args.model_size}_{args.dataset}_{args.dataset_size}"
+    pattern = f"*_{args.model_size}_{args.dataset}_{args.dataset_size}_test_size_{args.test_size}.parquet"
+    meta_model_base = f"meta_model_{meta_name}_{args.n_estimators}_{args.model_type}_{args.model_size}_{args.dataset}_{args.dataset_size}_test_size_{args.test_size}"
+    if args.test_size < 0:
+        meta_model_base = f"meta_model_{meta_name}_{args.n_estimators}_{args.model_type}_{args.model_size}_{args.dataset}_{args.dataset_size}"
+        pattern = f"*_{args.model_size}_{args.dataset}_{args.dataset_size}.parquet"
     out_path = f"meta/{meta_model_base}.joblib"
     path = pathlib.Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,12 +66,5 @@ if __name__ == "__main__":
         base_model_type=args.model_type,
         meta_model_type=args.meta_model_type,
         booster=args.booster,
-        tree_method = args.tree_method)
-"""
-     run_meta_training(dataset=args.dataset, dataset_size=args.dataset_size, model_type=args.model_type,
-         process_dfs=args.process_dfs, process_behaviors=args.process_behaviors,
-         data_dir_train=data_dir_train, data_dir_valid=data_dir_valid,
-         zip_file_train=zip_file_train, zip_file_valid=zip_file_valid,
-         user_category_profiles_path=user_category_profiles_path, resume=not args.dont_resume,
-         user_cluster_df_path=user_cluster_df_path, cluster_id=args.cluster_id, load_best_model=args.load_best_model, model_size=args.model_size, retrain_models=retrain_models, epochs=args.epochs)
-"""
+        tree_method = args.tree_method,
+        n_estimators = args.n_estimators)
