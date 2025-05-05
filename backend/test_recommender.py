@@ -27,7 +27,7 @@ if __name__ == "__main__":
     parser.add_argument("--retrain_models", type=str, default="", help="retrain_models for these types in comma separated list")
     parser.add_argument("--drift_fraction", type=float, default=0.5, help="Fraction of history to swap during adaptivity test (0.0–1.0)")
     parser.add_argument("--n_estimators", type=int, default=300, help="n_estimators for meta model name")
-    parser.add_argument("--test_size", type=float, default=0.2, help="test_size which validation scores meta model is trained on")
+    parser.add_argument("--test_size", type=float, default=-0.1, help="test_size which validation scores meta model is trained on")
     parser.add_argument("--use_model_base", action='store_true', help="Set to model_base naming for models")
     args = parser.parse_args()
     log_print(f"test_recommender.py with args: {parser.parse_args()}")

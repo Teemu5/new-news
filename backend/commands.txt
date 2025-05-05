@@ -110,6 +110,11 @@ running evaluation for 0.2 small dataset is 4566 batches taking 7:10
 
 
 
+python3 test_recommender.py --model_type all --dataset_size large --model_size small --load_best_model --eval_scope global --dataset valid --adaptivity_test --shuffle --drift_fraction 0.90 --dont_resume --epochs 1 --eval_separate --use_model_base
+
+
+
+
 TRAINING MODELS WITH COMMAND:
 python3 test_recommender.py --model_type all --dataset_size small --model_size small --load_best_model --eval_scope global --dataset train --adaptivity_test --shuffle --drift_fraction 0.90 --dont_resume --epochs 1 --eval_separate --use_model_base
 SMALL DATA SET IS SPLIT TO 0.8 TRAIN SET AND 0.2 VALIDATION SET!
@@ -168,3 +173,13 @@ python3 csv_combine_filter.py --filter_pattern 'results/*_random_0.9_best_model_
 python3 csv_combine_filter.py --filter_pattern 'results/*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS.csv'
 python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS_no_donor.csv' --auc
 python3 generate_summary.py --per_file --pattern 'results/filtered_*_random_0.9_best_model_small_all_valid_large_user_level_partial_results_2025-05-04_17-21-31_ALL_USERS_keep_donor.csv' --auc
+
+
+
+move files to other repo:
+cp model_utils.py test_recommender.py eval_meta_model.py train_meta_model.py train_category_models.py generate_summary.py csv_combine_filter.py backend.py Dockerfile commands.txt requirements.txt ../../new-news/backend/
+cp ../frontend/* ../../new-news/frontend/
+cd ..
+cp docker-compose.yml ../new-news/
+cp requirements-wsl.txt ../new-news/
+cp .gitignore ../new-news/
