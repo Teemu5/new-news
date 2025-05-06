@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-Combine *_small_valid_small_metrics.json files into one JSON.
-
-Each input file name has the form
-    <KEY>_small_valid_small_metrics.json
-
-The script uses <KEY> as the top‑level key in the output JSON.
-"""
 
 import argparse
 import glob
