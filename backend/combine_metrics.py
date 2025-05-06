@@ -102,6 +102,11 @@ def main(argv: list[str] | None = None) -> None:
         default="plot",
     )
     args = parser.parse_args(argv)
+
+### python3 combine_metrics.py --dir meta/results --out combined_meta_valid_small_metrics.json
+### python3 combine_metrics.py --dir meta/results --out combined_meta_valid_small_metrics.json --pattern meta_model_XGBClassifier_hist_300_*_small_train_small_valid.json --regex true
+###  python3 combine_metrics.py --vis plot --COMBINED combined_valid_small_metrics.json --META combined_meta_valid_small_metrics.json
+    
     if args.vis == "plot":
         vis_plot(args.COMBINED, args.META)
         return
