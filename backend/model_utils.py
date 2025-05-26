@@ -21,6 +21,7 @@ import nltk
 from nltk.corpus import stopwords
 from dateutil.parser import isoparse
 
+from sklearn.metrics import precision_recall_curve
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, SGDClassifier, LogisticRegressionCV
@@ -57,6 +58,7 @@ from tensorflow.keras.layers import (
     Multiply,
     Softmax,
     TimeDistributed,
+    MultiHeadAttention,
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -65,6 +67,7 @@ from tensorflow.keras.utils import Sequence, register_keras_serializable, custom
 from keras.models import Model, model_from_json
 
 from huggingface_hub import hf_hub_download
+from pathlib import Path
 
 from recommender import (
     fastformer_model_predict,
@@ -693,7 +696,7 @@ def build_user_profile_tensor(
                .tolist()
     )
     seqs = [
-        s if s else [tokenizer.oov_token or 1]  # avoid all-zero row
+        s if s else [tokenizer.oov_token or 1]
         for s in seqs
     ]
     history_array = pad_sequences(
@@ -825,12 +828,12 @@ def user_candidate_generation(
     min_tfidf_similarity=0.02,
     max_candidates=-1,
     max_title_length=30,
-    id_to_index=None,title_tensor=None
+    id_to_index=None,title_tensor=None, exclude_clicked=False
 ):
     """
     Generating a candidate pool for a single user.
     1. gather all articles that exist up to cutoff_time.
-    2. Exclude articles in user_history_ids.
+    (2. Exclude articles in user_history_ids.)
     3. Optionally apply TF–IDF filter.
     4. Return candidate_tensors, candidate_ids.
     """
@@ -843,7 +846,9 @@ def user_candidate_generation(
 
     logging.info(f"After Filtering candidate pool length: {len(candidate_pool)}")
     # remove user's history from the candidate pool
-    candidate_pool = list(set(candidate_pool) - set(user_history_ids))
+    candidate_pool = list(set(candidate_pool))
+    if exclude_clicked:
+        candidate_pool = list(set(candidate_pool) - set(user_history_ids))
     logging.info(f"After removing user history from candidate pool: {len(candidate_pool)}")
     # Build candidates_df
     candidates_df = news_df[news_df['NewsID'].isin(candidate_pool)].copy()
@@ -929,6 +934,7 @@ def write_partial_rows(rows, filename="user_level_partial_results.csv", results_
         header=not file_exists,  # write header if file doesn't exist
         index=False
     )
+
 def score_candidates_in_batch(history_tensor, candidate_tensors, model, batch_size=128):
 
     num_candidates = len(candidate_tensors)
@@ -1009,6 +1015,8 @@ def score_candidates_ensemble_batch(history_tensor, candidate_tensors, models_di
             X_meta = build_meta_features(scores,None,None)
             meta_preds = meta_model.predict_proba(X_meta)[:, 1]
             separate_stacking_scores[key] = meta_preds
+            log_print(f"X_meta:{X_meta}")
+            log_print(f"meta_preds:{meta_preds}")
 
 
     return separate_bagging_scores, separate_scores, separate_stacking_scores
@@ -1176,7 +1184,8 @@ def get_user_history_ids(user_id,
         if not txt.strip():
             continue
         for art in txt.split():
-            history_ids.append(art)
+            if art not in history_ids:
+                history_ids.append(art)
 
     return history_ids
 
@@ -1207,7 +1216,8 @@ def evaluate_and_buffer_user(
     partial_buffer=None, k_values=None, partial_csv="out.csv",
     donor_id = None,
     pad_zeros=True,
-    drift_fraction=0,user_profiles=None,id_to_index=None,title_tensor=None
+    drift_fraction=0,user_profiles=None,id_to_index=None,title_tensor=None,
+    use_full_avg_profile=False
 ):
     # Pads / substitutes the user_history_tensor, builds candidates, scores them with bagging, stacking, and individual models,
     # then writes partial CSV rows.
@@ -1254,19 +1264,24 @@ def evaluate_and_buffer_user(
         return
     logging.info(f"shown contains:{shown}")
 
-    user_history_tensor, used_ids, original_history_len = build_user_profile_tensor(
-        user_id=user_id,
-        behaviors_df=behaviors_df,
-        news_df=news_df,
-        cutoff_time_str=cutoff_time_str,
-        cutoff=cutoff,
-        tokenizer=tokenizer,
-        avg_profile=avg_profile,
-        pad_zeros=True,
-        max_history_length=max_history_length,
-        max_title_length=30,
-        history_ids=hist_ids
-    )
+    if use_full_avg_profile:
+        user_history_tensor = avg_profile
+        used_ids = []
+        original_history_len = 0
+    else:
+        user_history_tensor, used_ids, original_history_len = build_user_profile_tensor(
+            user_id=user_id,
+            behaviors_df=behaviors_df,
+            news_df=news_df,
+            cutoff_time_str=cutoff_time_str,
+            cutoff=cutoff,
+            tokenizer=tokenizer,
+            avg_profile=avg_profile,
+            pad_zeros=pad_zeros,
+            max_history_length=max_history_length,
+            max_title_length=30,
+            history_ids=hist_ids
+        )
     num_history_articles = len(used_ids)
     num_from_original = min(pivot, len(used_ids))
     num_from_donor    = num_history_articles - num_from_original
@@ -1290,6 +1305,7 @@ def evaluate_and_buffer_user(
         if tf.reduce_sum(user_history_tensor) == 0:
             logging.info(f"After pad, user {user_id} still zero, use full global avg")
             user_history_tensor = avg_profile
+    log_print(f"user_history_tensor:{user_history_tensor}")
     separate_bagging_scores, separate_scores, separate_stacking_scores = score_candidates_ensemble_batch(
         tf.expand_dims(user_history_tensor, 0),
         candidate_tensors,
@@ -1459,7 +1475,7 @@ def run_experiments_user_level(cluster_mapping, viable_donors, train_data, test_
                                     rebuild_after_drift=False,measure_warm_up=3,seed=42,shuffle_user=False,avg_profile=None,         
                                     user_profiles=None,id_to_index=None,title_tensor=None,
                                     meta_model_path = "meta/meta_model_XGBClassifier_hist_cluster_small_train_small.pkl",
-                                    encoder_path = None,meta_model_pattern=None):
+                                    encoder_path = None,meta_model_pattern=None, pad_zeros=True, use_full_avg_profile=False):
     logging.info(f"partial_csv: {partial_csv}, viable_donors:{viable_donors}, models_dict:{models_dict}, model_type:{model_type}, dataset_size:{dataset_size}, model_size:{model_size}")
     results = []
     total_articles = len(news_df)
@@ -1566,7 +1582,9 @@ def run_experiments_user_level(cluster_mapping, viable_donors, train_data, test_
                     partial_csv=partial_csv, hist_ids=real_history_ids,
                     pivot=len(real_history_ids), donor_id=None,
                     user_profiles=user_profiles,
-                    id_to_index=id_to_index, title_tensor=title_tensor
+                    id_to_index=id_to_index, title_tensor=title_tensor,
+                    pad_zeros=pad_zeros,
+                    use_full_avg_profile=use_full_avg_profile
                 )
 
                 logging.info(f"user_id={user_id},real_history_ids:{real_history_ids}")
@@ -1589,7 +1607,9 @@ def run_experiments_user_level(cluster_mapping, viable_donors, train_data, test_
                         drift_fraction=drift_fraction,
                         user_profiles=user_profiles,
                         id_to_index=id_to_index,
-                        title_tensor=title_tensor
+                        title_tensor=title_tensor,
+                        pad_zeros=pad_zeros,
+                        use_full_avg_profile=use_full_avg_profile
                     )
                     
             except Exception as e:
@@ -1615,10 +1635,152 @@ def run_experiments_user_level(cluster_mapping, viable_donors, train_data, test_
     print("Cluster-level experiment results saved to 'user_level_experiment_results.csv'")
     return results_df
 
+def transform_history(hist_ids, *, strategy="full",
+                      k=50, donor_ids=None, pivot=5):
+    if strategy == "truncate":
+        return hist_ids[-k:]
+    if strategy == "remove":
+        return []
+    if strategy == "swap":
+        if donor_ids is None:
+            raise ValueError("donor_ids required for swap")
+        tail_len  = max(0, len(hist_ids) - pivot)
+        return donor_ids[-pivot:] + hist_ids[-tail_len:]
+    return hist_ids
 
+def get_donor_history(target_uid, impression_time, behaviors_df,
+                      max_len=50, rng=np.random.default_rng()):
+    cand_mask = (behaviors_df['Time'] <= impression_time) & \
+                (behaviors_df['UserID'] != target_uid)
+    donors = behaviors_df.loc[cand_mask, 'UserID'].unique()
+    if donors.size == 0:
+        return []
+
+    donor_uid = rng.choice(donors)
+
+    donor_rows = behaviors_df[
+        (behaviors_df['UserID'] == donor_uid) &
+        (behaviors_df['Time'] <= impression_time)
+    ]
+    donor_clicks = []
+    for h in donor_rows['HistoryText']:
+        if pd.notna(h):
+            donor_clicks.extend(h.split())
+
+    return donor_clicks[-max_len:]
+
+def pad_or_trunc(
+        news_ids: list[str],
+        news_text_dict: dict[str, list[int]],
+        max_history_length: int,
+        max_title_length: int
+    ) -> list[list[int]]:
+
+    # look up every title; fall back to all-zeros if a NewsID is missing
+    title_tokens = [
+        news_text_dict.get(nid, [0] * max_title_length)[:max_title_length]
+        for nid in news_ids[-max_history_length:]
+    ]
+    # left-pad with rows of zeros so that len == max_history_length
+    pad_rows = max_history_length - len(title_tokens)
+    if pad_rows > 0:
+        title_tokens = [[0]*max_title_length]*pad_rows + title_tokens
+    return title_tokens
+
+def make_eval_sets_from_train(
+        df: pd.DataFrame,
+        pivots: list[int] = (45,),
+        ks:     list[int] = (5,),
+        frac:   float     = 1.0,
+        dataset: str      = "valid",
+        dataset_size: str = "small",
+        out_dir:  str     = ".",
+    ):
+    print(f"columns in original df:{df.columns}")
+    """
+    Build eval-frames that look exactly like train_df and store them as pickles.
+    --------------------------------------------------------------------------
+    * frac    – sample only a fraction to speed up experimentation
+    * pivots  – sizes for the 'swap' history variant
+    * ks      – last-k history variants
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    if frac < 1.0:
+        subset_tag = f"_{frac}"
+        #base = sample_behaviors(df, frac)
+    else:
+        subset_tag = ""
+        #base = df
+    base = df.sample(frac=frac, random_state=0).reset_index(drop=True)
+
+    ### history variants ----------------------------------------------------
+    rng = np.random.default_rng(0)
+    donor_histories = base["HistoryTitles"].sample(frac=1, random_state=1).tolist()
+
+    variants: dict[str, list] = {"Hist_full": base["HistoryTitles"]}
+
+    for k in ks:
+        variants[f"Hist_k{k}"] = base["HistoryTitles"].apply(lambda h: h[-k:])
+
+    for p in pivots:
+        variants[f"Hist_swap{p}"] = [
+            donor[-p:] + hist[-(len(hist) - p):]
+            for donor, hist in zip(donor_histories, base["HistoryTitles"])
+        ]
+    def _fname(stem):
+        return (f"{out_dir}/evaluation_{dataset}_{dataset_size}"
+                f"{subset_tag}_{stem}{subset_tag}.pkl")
+    ### write out one DataFrame per variant ---------------------------------
+    keep = ["UserID", "CandidateTitleTokens", "Label", "ImpressionID"]
+    for name, hist_col in variants.items():
+        out = base[keep].copy()
+        out["HistoryTitles"] = hist_col
+        #fname = f"{out_dir}/evaluation_{dataset}_{dataset_size}_{_fname(name)}.pkl"
+        
+        print(f"columns in out df:{out.columns}")
+        print(f"writing to {_fname(name)}")
+        out.to_pickle(_fname(name), protocol=4)   # ⚑ fastest & smallest for nested lists
+
+def load_full_news(train_dir, dev_dir, dev_dir_big = 'dataset/valid/'):
+    cols = ['NewsID','Category','SubCategory','Title','Abstract',
+            'URL','TitleEntities','AbstractEntities']
+    print(f"loading from {train_dir}")
+    news_train = pd.read_csv(os.path.join(train_dir, 'news.tsv'), sep='\t',
+                names=cols, index_col=False)
+    print(f"loaded news {news_train}")
+    print(f"loading from {dev_dir}")
+    news_dev   = pd.read_csv(os.path.join(dev_dir,   'news.tsv'), sep='\t',
+                names=cols, index_col=False)
+    print(f"loaded news {news_dev}")
+    print(f"loading from {dev_dir_big}")
+    news_dev_big   = pd.read_csv(os.path.join(dev_dir_big,   'news.tsv'), sep='\t',
+                names=cols, index_col=False)
+    print(f"loaded news {news_dev_big}")
+    news_train['CleanTitle'] = news_train['Title'].apply(clean_text)
+    news_train['CleanAbstract'] = news_train['Abstract'].apply(clean_text)
+    news_train['CombinedText'] = news_train['CleanTitle'] + ' ' + news_train['CleanAbstract']
+    news_train["CombinedText"] = news_train["CombinedText"].astype(str)
+    news_train["CombinedText"] = news_train["CombinedText"].fillna("")
+
+    news_dev['CleanTitle'] = news_dev['Title'].apply(clean_text)
+    news_dev['CleanAbstract'] = news_dev['Abstract'].apply(clean_text)
+    news_dev['CombinedText'] = news_dev['CleanTitle'] + ' ' + news_dev['CleanAbstract']
+    news_dev["CombinedText"] = news_dev["CombinedText"].astype(str)
+    news_dev["CombinedText"] = news_dev["CombinedText"].fillna("")
+
+    news_dev_big['CleanTitle'] = news_dev_big['Title'].apply(clean_text)
+    news_dev_big['CleanAbstract'] = news_dev_big['Abstract'].apply(clean_text)
+    news_dev_big['CombinedText'] = news_dev_big['CleanTitle'] + ' ' + news_dev_big['CleanAbstract']
+    news_dev_big["CombinedText"] = news_dev_big["CombinedText"].astype(str)
+    news_dev_big["CombinedText"] = news_dev_big["CombinedText"].fillna("")
+    news_full  = (pd.concat([news_train, news_dev, news_dev_big], ignore_index=True)
+                .drop_duplicates('NewsID'))
+    return news_full
 
 def prepare_train_df(
     data_dir,
+    train_data_dir,
+    valid_data_dir,
     news_file,
     behaviors_file,
     user_category_profiles,
@@ -1628,11 +1790,33 @@ def prepare_train_df(
     max_history_length=50,
     downsampling=False,
     categorized_samples=False,
-    news_df_pkl="models/news_df_processed.pkl", train_df_pkl="models/train_df_processed.pkl"
+    news_df_pkl="models/news_df_processed.pkl", train_df_pkl="models/train_df_processed.pkl",
+    test_size=0.2, split_indepently=False, dataset="train", dataset_size="small", process_valid_sets=False, behavior_pickle = "",
+    eval_frac=1.0, big_tokenizer=False, pivots=[45], ks=[5]
     ):
+    log_print(f"""data_dir={data_dir},
+    valid_data_dir={valid_data_dir},
+    news_file={news_file},
+    behaviors_file={behaviors_file},
+    user_category_profiles={user_category_profiles},
+    downsampling={downsampling},
+    categorized_samples={categorized_samples},
+    news_df_pkl={news_df_pkl}, train_df_pkl={train_df_pkl},
+    test_size={test_size}""")
+    news_full = load_full_news(train_data_dir, valid_data_dir)
+    if dataset == "valid":
+        data_dir=valid_data_dir
+    print(f"loading data from dir data_dir:{data_dir}")
     news_path = os.path.join(data_dir, news_file)
     news_df = pd.read_csv(
         news_path,
+        sep='\t',
+        names=['NewsID', 'Category', 'SubCategory', 'Title', 'Abstract', 'URL', 'TitleEntities', 'AbstractEntities'],
+        index_col=False
+    )
+    train_news_path = os.path.join(train_data_dir, news_file)
+    train_news_df = pd.read_csv(
+        train_news_path,
         sep='\t',
         names=['NewsID', 'Category', 'SubCategory', 'Title', 'Abstract', 'URL', 'TitleEntities', 'AbstractEntities'],
         index_col=False
@@ -1641,12 +1825,15 @@ def prepare_train_df(
     print(news_df.head())
 
     behaviors_path = os.path.join(data_dir, behaviors_file)
-    behaviors_df = pd.read_csv(
-        behaviors_path,
-        sep='\t',
-        names=['ImpressionID', 'UserID', 'Time', 'HistoryText', 'Impressions'],
-        index_col=False
-    )
+    if behavior_pickle == "":
+        behaviors_df = pd.read_csv(
+            behaviors_path,
+            sep='\t',
+            names=['ImpressionID', 'UserID', 'Time', 'HistoryText', 'Impressions'],
+            index_col=False
+        )
+    else:
+        behaviors_df = pd.read_pickle(behavior_pickle)
     print("Loaded behaviors data:")
     print(behaviors_df.head())
 
@@ -1656,6 +1843,34 @@ def prepare_train_df(
     news_df["CombinedText"] = news_df["CombinedText"].astype(str)
     news_df["CombinedText"] = news_df["CombinedText"].fillna("")
 
+    # Fit the tokenizer as it was fitted for model training!!!!!!!!!! Tokenizer needs to be exact same as it was during training to match mapping
+    train_news_df['CleanTitle'] = train_news_df['Title'].apply(clean_text)
+    train_news_df['CleanAbstract'] = train_news_df['Abstract'].apply(clean_text)
+    train_news_df['CombinedText'] = train_news_df['CleanTitle'] + ' ' + train_news_df['CleanAbstract']
+    train_news_df["CombinedText"] = train_news_df["CombinedText"].astype(str)
+    train_news_df["CombinedText"] = train_news_df["CombinedText"].fillna("")
+    tokenizer = Tokenizer()
+    tokenizer.fit_on_texts(train_news_df["CombinedText"].tolist())
+
+    vocab_size = len(tokenizer.word_index) + 1
+    print(f"Vocabulary Size: {vocab_size}")
+    with open('train_tokenizer.pkl', 'wb') as f:
+        pickle.dump(tokenizer, f)
+    """
+    padded = pad_sequences(
+        tokenizer.texts_to_sequences(news_df["CombinedText"]),
+        maxlen=30, padding='post', truncating='post'
+    )
+    news_df["PaddedText"] = padded.tolist()
+    """
+    news_df['EncodedText'] = tokenizer.texts_to_sequences(news_df['CombinedText'])
+    news_df['PaddedText'] = list(pad_sequences(news_df['EncodedText'], maxlen=max_title_length, padding='post', truncating='post'))
+    #news_full["PaddedText"] = pad_sequences(
+    #    tokenizer.texts_to_sequences(news_full["CombinedText"]),
+    #    maxlen=30, padding='post', truncating='post')
+    news_text_dict = dict(zip(news_df["NewsID"], news_df["PaddedText"]))
+
+    """
     tokenizer = Tokenizer()
     tokenizer.fit_on_texts(news_df['CombinedText'].tolist())
     vocab_size = len(tokenizer.word_index) + 1
@@ -1666,6 +1881,7 @@ def prepare_train_df(
     news_df['EncodedText'] = tokenizer.texts_to_sequences(news_df['CombinedText'])
     news_df['PaddedText'] = list(pad_sequences(news_df['EncodedText'], maxlen=max_title_length, padding='post', truncating='post'))
     news_text_dict = dict(zip(news_df['NewsID'], news_df['PaddedText']))
+    """
 
     def parse_impressions(impressions):
         impression_list = impressions.split()
@@ -1681,15 +1897,20 @@ def prepare_train_df(
         return news_ids, labels
 
     # Parse news ids and labels behaviors data
+    log_print(f"Parsing 'ImpressionNewsIDs', 'ImpressionLabels'")
     behaviors_df[['ImpressionNewsIDs', 'ImpressionLabels']] = behaviors_df['Impressions'].apply(
         lambda x: pd.Series(parse_impressions(x))
     )
 
     train_samples = []
+    log_print(f"Creating category map")
+    category_map = dict(zip(news_df['NewsID'], news_df['Category']))
+    #candidate_category_series = news_df[news_df['NewsID'] == candidate_news_id]['Category']
     # Iterate over behaviors to create train samples
+    # for row in tqdm(behaviors_df.itertuples(index=False), total=len(behaviors_df)):
     for _, row in tqdm(behaviors_df.iterrows(), total=behaviors_df.shape[0]):
         user_id = row['UserID']
-        user_cluster = row['Cluster'] if 'Cluster' in row else None
+        #user_cluster = row['Cluster'] if 'Cluster' in row else None
 
         # Parse user history
         history_ids = row['HistoryText'].split() if pd.notna(row['HistoryText']) else []
@@ -1704,18 +1925,20 @@ def prepare_train_df(
 
         candidate_news_ids = row['ImpressionNewsIDs']
         labels = row['ImpressionLabels']
-
+        impr_id = row['ImpressionID']
         for candidate_news_id, label in zip(candidate_news_ids, labels):
             candidate_text = news_text_dict.get(candidate_news_id, [0]*max_title_length)
             sample = {
+                'ImpressionID'        : impr_id,
                 'UserID': user_id,
                 'HistoryTitles': history_texts,
                 'CandidateTitleTokens': candidate_text,
                 'Label': label
             }
             if categorized_samples:
-                candidate_category_series = news_df[news_df['NewsID'] == candidate_news_id]['Category']
-                candidate_category = candidate_category_series.iloc[0] if not candidate_category_series.empty else "Unknown"
+                #candidate_category_series = news_df[news_df['NewsID'] == candidate_news_id]['Category']
+                #candidate_category = candidate_category_series.iloc[0] if not candidate_category_series.empty else "Unknown"
+                candidate_category = category_map.get(candidate_news_id, "Unknown")
                 sample['CandidateCategory'] = candidate_category
             train_samples.append(sample)
 
@@ -1832,24 +2055,582 @@ def prepare_train_df(
     print(f"Cluster:{train_df['Cluster']}")
     print("Splitting data into training and validation sets for each cluster...")
     clustered_data = {}
+    clustered_data = make_clustered_data(train_df, num_clusters, test_size=test_size, random_state=42, split_indepently=split_indepently)
+    """
     for cluster in range(num_clusters):
         cluster_data = train_df[train_df['Cluster'] == cluster]
 
         if cluster_data.empty:
             print(f"No data for Cluster {cluster}. Skipping...")
             continue  # Skip to the next cluster
-
-        train_data, val_data = train_test_split(cluster_data, test_size=0.2, random_state=42, stratify=None)
+        if test_size > 0.0:
+            train_data, val_data = train_test_split(cluster_data, test_size=test_size, random_state=42, stratify=None)
+            else:
+                train_data = cluster_data
+                val_data = {}
         clustered_data[cluster] = {
             'train': train_data.reset_index(drop=True),
             'val': val_data.reset_index(drop=True)
         }
-        print(f"Cluster {cluster}: {len(train_data)} training samples, {len(val_data)} validation samples.")
+    """
     print(f"Saved after processing: {news_df_pkl}, {train_df_pkl}")
     news_df.to_pickle(news_df_pkl)
     train_df.to_pickle(train_df_pkl)
 
+    print("Columns in behaviors_df:")
+    print(behaviors_df.columns)
+    print("Columns in train_df:")
+    print(train_df.columns)
+    #pivots=[25,40,45,49]
+    #ks=[10,5,1]
+    if process_valid_sets:
+        # def make_eval_sets(df, news_text_dict, max_hist=50, max_len=30, pivots=[25,40,45,49], ks=[10,5,1])
+        """
+        make_eval_sets_vectorized(
+            behaviors_df, news_text_dict,
+            max_hist=max_history_length,
+            max_len=max_title_length,
+            pivots=pivots, ks=ks,
+            dataset=dataset, dataset_size=dataset_size
+        )
+
+        dfs = make_eval_sets(
+                behaviors_df, news_text_dict,
+                max_hist=max_history_length,
+                max_len=max_title_length,
+                pivots=pivots, ks=ks,
+                dataset=dataset, dataset_size=dataset_size
+        )
+        dfs = make_eval_sets_light(behaviors_df,
+            news_text_dict,
+            max_hist=max_history_length,
+            max_len=max_title_length,
+            pivots=pivots,
+            ks=ks,
+            dataset=dataset,
+            dataset_size=dataset_size,
+            frac=eval_frac)
+        """
+
+        make_eval_sets_from_train(
+                train_df,
+                pivots=pivots,
+                ks=ks,
+                frac=eval_frac,
+                dataset=dataset,
+                dataset_size=dataset_size
+            )
+
     return clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters
+
+def grouped_update(df, scores, tracker, uid_col="UserID"):
+    """
+    Feed one DataFrame batch and its model scores into tracker.
+
+    Parameters
+    ----------
+    df      : DataFrame with 'Label' and uid_col columns
+    scores  : 1‑D NumPy array, aligned with df rows
+    tracker : RankingMetricsTracker instance
+    """
+    df = df.copy()
+    df["Score"] = scores
+    for _, grp in df.groupby(uid_col):
+        tracker.update(grp["Label"].values, grp["Score"].values)
+
+def run_eval(df, model, title_tensor, id2index,
+             batch_size=512, k_vals=(5, 10, 20)):
+    """
+    Evaluate *model* on *df* using RankingMetricsTracker.
+
+    df must contain ['UserID', 'CandidateID', 'Label', 'HistoryTitles'].
+    """
+    tracker = RankingMetricsTracker(k_values=k_vals)
+
+    # simple batching by row index
+    for _, batch in df.groupby(np.arange(len(df)) // batch_size, sort=False):
+        hist  = tf.stack(batch["HistoryTitles"].to_list())            # [B,50,30]
+        #indices = [id2index[nid] for nid in batch["CandidateID"]]
+        pad_idx = id2index.setdefault("_PAD_", title_tensor.shape[0])   # one-time
+        indices = [id2index.get(nid, pad_idx) for nid in batch["CandidateID"]]
+
+        cand    = tf.gather(title_tensor, indices)
+        hist  = tf.convert_to_tensor(hist,  dtype=tf.int32)
+        cand  = tf.convert_to_tensor(cand,  dtype=tf.int32)
+        scores = model([hist, cand]).numpy()
+        #scores = model(hist, cand).numpy()                            # [B]
+
+        grouped_update(batch, scores, tracker)   # <─ one call per batch
+
+    return tracker.result()
+
+from tqdm import tqdm
+
+def explode_slate(df):
+    tmp = df["Impressions"].str.split(expand=True).stack()
+    out = df.loc[tmp.index.get_level_values(0)].copy()
+    pair = tmp.str.split('-', n=1, expand=True)
+    out["CandidateID"] = pair[0].values
+    out["Label"]       = pair[1].astype("int8").values
+    return out.reset_index(drop=True)
+
+
+import dask.dataframe as dd
+from dask.diagnostics import ProgressBar
+
+def explode_slate_dask(df, npartitions=28):
+    ddf = dd.from_pandas(df, npartitions=npartitions)
+    ddf2 = (
+        ddf
+        .assign(Impression=ddf["Impressions"].str.split(" "))
+        .explode("Impression")
+    )
+    pair = ddf2["Impression"].str.split("-", n=1, expand=True)
+    ddf2["CandidateID"] = pair[0]
+    ddf2["Label"]       = pair[1].astype("int8")
+
+    with ProgressBar():
+        result = ddf2.drop(columns="Impression").compute()
+
+    return result
+def cache_titles(text_dict, max_len):
+    ids, mats = zip(*text_dict.items())  # mats is a sequence of numpy arrays
+
+    # build a list of Python lists of length exactly max_len
+    padded = []
+    for mat in mats:
+        # ensure it's a Python list
+        seq = list(mat)
+        if len(seq) >= max_len:
+            seq = seq[:max_len]
+        else:
+            seq = seq + [0] * (max_len - len(seq))
+        padded.append(seq)
+
+    # now stack into a NumPy array
+    X = np.array(padded, dtype=np.int32)
+
+    # map each NewsID to its row in X
+    id2row = {nid: idx for idx, nid in enumerate(ids)}
+    return id2row, X
+
+def pad_tensor(hist_ids, id2row, tbl, max_hist, pad_row):
+    out = np.empty((max_hist, tbl.shape[1]), dtype="int32")
+    out[:] = pad_row                                    # pre-fill zeros
+    idx = np.fromiter((id2row.get(nid, -1) for nid in hist_ids[-max_hist:]),
+                      dtype="int32")
+    if len(idx):
+        out[-len(idx):] = tbl[idx]          # gather rows in one shot
+    return out
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from numba import njit
+from numba.typed import List
+from typing import Dict, Any
+
+def make_eval_sets_vectorized(
+    df: pd.DataFrame,
+    news_text_dict: Dict[int,str],
+    max_hist: int = 50,
+    max_len: int = 30,
+    pivots: list[int] = [25,40,45,49],
+    ks: list[int]    = [10,5,1],
+    dataset: str     = "valid",
+    dataset_size: str= "small"
+) -> None:
+    """
+    Builds your three (full / last-k / swap-pivot) evaluation sets in a single
+    fast, vectorized pass.  Saves each to
+      evaluation_{dataset}_{dataset_size}_{variant}.parquet
+    """
+    print("make_eval_sets_vectorized")
+    # --- 1) PREPROCESS & EXPLODE ------------------------------------------------
+
+    df = df.copy()
+    # parse Time if necessary
+    if df["Time"].dtype == object:
+        df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
+
+    print("explode_slate_dask")
+    # explode your slate / build raw token-ID lists
+    base = explode_slate_dask(df)  
+    # assume HistoryText is a space-separated string of integer token IDs
+    print("process history")
+    base["HistIDs"] = base["HistoryText"] \
+                         .fillna("") \
+                         .str.split() \
+                         .map(lambda toks: [int(t[1:]) for t in toks])
+
+    print("build pools")
+    # build daily donor pools (as before)
+    base["Date"] = base["Time"].dt.floor("D")
+    pools = (base.groupby("Date")["HistIDs"]
+                 .agg(lambda s: list({tuple(h) for h in s if h}))
+                 .to_dict())
+
+    rng = np.random.default_rng(0)
+    def pick_donor(hist: list[int], date) -> list[int]:
+        pool = pools[date]
+        if len(pool) == 1:
+            return hist[-max_hist:]
+        donor = pool[rng.integers(len(pool))]
+        return donor[-max_hist:]
+
+    base["DonorHist"] = [
+        pick_donor(h, d) for h,d in zip(base["HistIDs"], base["Date"])
+    ]
+
+    print("conv to list")
+    # turn your two columns into Python lists (once)
+    hist_lists  = base["HistIDs"].tolist()
+    donor_lists = base["DonorHist"].tolist()
+    N = len(hist_lists)
+
+    # --- 2) CACHE TOKENS --------------------------------------------------------
+
+    # this is identical to your cache_titles call
+    print("cache_titles")
+    id2row, title_tbl = cache_titles(news_text_dict, max_len)
+
+    # build a dense numpy lookup for id2row[tok]
+    int_keys = [int(tok) for tok in id2row.keys()]
+    max_tok  = max(int_keys)
+    print(f"max token ID = {max_tok}")
+
+    id2row_arr = np.full((max_tok + 1,), -1, dtype=np.int32)
+    for tok_str, rid in id2row.items():
+        tok = int(tok_str)
+        id2row_arr[tok] = rid
+    
+    print("id2row_arr")
+    # convert your Python lists into Numba‐typed lists …
+    nb_hist  = List()
+    nb_donor = List()
+    for h,d in zip(hist_lists, donor_lists):
+        nb_hist.append(List(h))
+        nb_donor.append(List(d))
+
+    print("njit")
+    # JIT‐compile the array builder …
+    @njit
+    def build_array(all_hists, id2row_arr, max_hist, max_len):
+        n = len(all_hists)
+        out = np.zeros((n, max_hist, max_len), dtype=np.int32)
+        for i in range(n):
+            hist = all_hists[i]
+            L    = len(hist)
+            start = max(0, L - max_hist)
+            for j in range(start, L):
+                tokens = hist[j]
+                row    = j - start
+                tmax   = min(len(tokens), max_len)
+                for t in range(tmax):
+                    out[i, row, t] = id2row_arr[tokens[t]]
+        return out
+
+    # full histories
+    print(" ▸ JIT‐building full-history tensor…")
+    hist_full = build_array(nb_hist, id2row_arr, max_hist, max_len)
+
+    # donor histories (for swap)
+    print(" ▸ JIT‐building donor‐history tensor…")
+    hist_donor = build_array(nb_donor, id2row_arr, max_hist, max_len)
+
+
+    # --- 4) SLICE OUT YOUR VARIANTS ----------------------------------------------
+
+    # “last-k” variants
+    hist_k = {k: hist_full[:, -k:, :] for k in ks}
+
+    # “pivot-swap” variants
+    hist_swap = {}
+    for p in pivots:
+        # take last‐p rows from donor, then last‐(max_hist-p) from full
+        first  = hist_donor[:, -p:, :]
+        second = hist_full[:, -(max_hist-p):, :]
+        hist_swap[p] = np.concatenate([first, second], axis=1)
+
+
+    # --- 5) DUMP TO PARQUET ------------------------------------------------------
+
+    keep = ["UserID", "CandidateID", "Label"]
+
+    # helper to wrap a (N,*,*) array as a list‐column + write
+    def df_and_write(arr: np.ndarray, name: str):
+        df_out = base[keep].copy()
+        # store the tensor as a Python object per‐row
+        df_out["HistoryTitles"] = list(arr)
+        # now add your candidate token features
+        df_tok = add_candidate_tokens(df_out, news_text_dict)
+        path = f"evaluation_{dataset}_{dataset_size}_{name}.parquet"
+        df_tok.to_parquet(path, index=False)
+        print("   → wrote", path)
+
+    # full
+    print("▸ Writing full history…")
+    df_and_write(hist_full, "full")
+
+    # last-k
+    for k, arr in hist_k.items():
+        print(f"▸ Writing last-{k} history…")
+        df_and_write(arr, f"k{k}")
+
+    # pivot-swap
+    for p, arr in hist_swap.items():
+        print(f"▸ Writing swap-{p} history…")
+        df_and_write(arr, f"swap{p}")
+
+    print("✅ Done.")
+
+
+
+def make_eval_sets(df, news_text_dict, max_hist=50, max_len=30, pivots=[25,40,45,49], ks=[10,5,1], dataset="valid", dataset_size="small"):
+    print("make_eval_sets")
+
+    df = df.copy()
+    if df["Time"].dtype == "O":
+        df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
+
+    base = explode_slate(df)
+    base["HistIDs"] = base["HistoryText"].fillna("").str.split()
+    print("base")
+
+    # ---- build donor pools once per day (pure C) ------------------------
+    base["Date"] = base["Time"].dt.floor("D")          # 7 unique dates
+    pools = (base.groupby('Date')["HistIDs"]
+                  .agg(lambda s: list({tuple(h) for h in s.dropna()}))
+                  .to_dict())
+    print("pools done")
+
+    rng = np.random.default_rng(0)
+    def pick_donor(row):
+        pool = pools[row.Date]
+        if len(pool) == 1:
+            return row.HistIDs[-max_hist:]
+        donor = pool[rng.integers(len(pool))]
+        return donor[-max_hist:]
+
+    base["DonorHist"] = base.apply(pick_donor, axis=1)
+    print("donors added")
+    cols = ["Hist_full"]
+
+    # ---- three history variants (no Python loops) -----------------------
+    for pivot in pivots:
+        cols.append(f"Hist_swap{pivot}")
+        base[f"Hist_swap{pivot}"] = base.apply(
+            lambda r: list(r.DonorHist)[-pivot:]
+                    + list(r.HistIDs)[-(max_hist - pivot):],
+            axis=1
+        )
+    for k in ks:
+        cols.append(f"Hist_k{k}")
+        base[f"Hist_k{k}"] = base["HistIDs"].str[-k:]
+    #base["Hist_swap"]  = (base["DonorHist"].str[-pivot:]
+    #                      + base["HistIDs"].str[-(max_hist-pivot):])
+    base["Hist_full"]  = base["HistIDs"]
+    print("hist variants done")
+
+    # ---- build tensors --------------------------------------------------
+    id2row, title_tbl  = cache_titles(news_text_dict, max_len)
+    pad_row = np.zeros((max_len,), dtype="int32")
+
+    print("building hist tensors")
+    tqdm.pandas(desc="tensor")
+    #for col in ("Hist_full", "Hist_k10", "Hist_swap"):
+    for col in cols:
+        base[col] = base[col].progress_apply(
+            pad_tensor,
+            args=(id2row, title_tbl, max_hist, pad_row)
+        )
+    print("finishing")
+
+    keep = ["UserID", "CandidateID", "Label"]
+    dfs = []
+    for col in cols:
+        log_print(f"finishing processing {col}")
+        df = base[keep+[col] ].rename(columns={col:"HistoryTitles"})
+        df = df.reset_index(drop=True)
+        df = add_candidate_tokens(df, news_text_dict)
+        df.to_pickle(f"evaluation_{dataset}_{dataset_size}_{col}.pkl")
+    
+    """df_full = base[keep+["Hist_full"] ].rename(columns={"Hist_full":"HistoryTitles"})
+    df_k10  = base[keep+["Hist_k10"]  ].rename(columns={"Hist_k10":"HistoryTitles"})
+    df_swap = base[keep+["Hist_swap"] ].rename(columns={"Hist_swap":"HistoryTitles"})
+    return (df_full.reset_index(drop=True),
+            df_k10.reset_index(drop=True),
+            df_swap.reset_index(drop=True))
+    """
+    return dfs
+
+from functools import partial
+import functools
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+def _slice_history(hist, keep):
+    """Return the *last* `keep` items from a list; used vectorised."""
+    return hist[-keep:] if len(hist) > keep else hist
+
+def sample_behaviors(df: pd.DataFrame, frac: float, seed: int = 42):
+    #Return a random subset of impressions (not rows)
+    keep_impr = (
+        df["ImpressionID"]
+        .drop_duplicates()
+        .sample(frac=frac, random_state=seed)
+    )
+    return df[df["ImpressionID"].isin(keep_impr)]
+
+def _to_list_int32(x):
+    """Arrow accepts nested Python lists, not 2-D ndarrays."""
+    # 1. Arrow scalars ─> Python → list
+    if hasattr(x, "as_py"):         # ArrowExtensionArray element
+        x = x.as_py()               # list / nested list
+
+    # 2. NumPy arrays → list
+    if isinstance(x, np.ndarray):
+        return x.astype(np.int32).tolist()
+
+    # 3. Python list → enforce int32 dtype element-wise
+    return np.asarray(x, dtype=np.int32).tolist()
+
+def process_and_to_parquet(out: pd.DataFrame, path: str) -> None:
+    for col in ("HistoryTitles", "CandidateTitleTokens"):
+        out[col] = [_to_list_int32(v) for v in out[col]._values]
+
+    # now every cell is a *list* (1-D for Candidate, 2-D for History)
+    out.to_parquet(path, engine="pyarrow", row_group_size=100_000)
+
+def make_eval_sets_light(df,
+                          news_text_dict,
+                          max_hist=50,
+                          max_len=30,
+                          pivots=(45,),
+                          ks=(5,),
+                          dataset="valid",
+                          dataset_size="small",
+                          rng_seed=0,
+                          out_dir=".",
+                          compression="snappy",
+                          frac=1.0):
+    """
+    Build compact evaluation files that differ only in the HistoryTitles
+    column.  Every other column (UserID, CandidateID, Label,
+    CandidateTitleTokens) is identical to train_df.
+    """
+    print(f"frac:{frac}")
+    df = df.copy()
+    if frac < 1.0:
+        subset_tag = f"_{frac}"
+        df = sample_behaviors(df, frac)
+    else:
+        subset_tag = ""
+    if df["Time"].dtype == "O":
+        df["Time"] = pd.to_datetime(df["Time"], utc=True, errors="coerce")
+
+    base = explode_slate(df)                       # identical to training
+    base["HistIDs"] = base["HistoryText"].fillna("").str.split()
+
+    base["CandidateTitleTokens"] = base["CandidateID"].map(
+        lambda nid: news_text_dict.get(nid, [0]*max_len)
+    )
+
+    # ---------------- donor pools – one list per day --------------------
+    base["Date"] = base["Time"].dt.floor("D")
+    pools = (base.groupby("Date")["HistIDs"]
+                   .agg(lambda s: list({tuple(h) for h in s if h}))
+                   .to_dict())
+    log_print(f"pools:{pools}")
+
+    rng = np.random.default_rng(rng_seed)
+    def _pick_donor(hist_ids, date):
+        pool = pools[date]
+        if len(pool) <= 1:
+            return hist_ids
+        donor_tuple = pool[rng.integers(len(pool))]
+        return list(donor_tuple)
+    def _pick_donor2(hist_ids, date):
+        pool = pools[date]
+        donor = rng.choice(pool) if len(pool) > 1 else hist_ids
+        return donor
+
+    base["DonorHist"] = [ _pick_donor(h,d) for h,d in
+                          zip(base["HistIDs"], base["Date"]) ]
+
+    # ----------------- write one Parquet per variant --------------------
+    def encode_history(hist_ids):
+        """Turn ['N123', 'N456', …] → list[list[int]] length max_hist."""
+        rows = []
+        for nid in hist_ids[-max_hist:]:
+            rows.append(news_text_dict.get(nid, [0]*max_len)[:max_len])
+        pad = max_hist - len(rows)
+        if pad:
+            rows = [[0]*max_len]*pad + rows
+        return rows
+
+    base["HistoryTitles"] = base["HistIDs"].apply(encode_history)
+    keep_cols = ["UserID", "CandidateID", "Label",
+                 "CandidateTitleTokens", "HistoryTitles"]
+
+    def _fname(stem):
+        return (f"{out_dir}/evaluation_{dataset}_{dataset_size}"
+                f"{subset_tag}_{stem}.parquet")
+
+    # full-history (unchanged)
+    #out = base[keep_cols + ["HistIDs"]].rename(
+    #        columns={"HistIDs": "HistoryTitles"})
+    out = base[keep_cols].copy()
+    #out["HistoryTitles"]        = out["HistoryTitles"].astype("object")
+    #out["CandidateTitleTokens"] = out["CandidateTitleTokens"].astype("object")
+    #print(f"processing HistoryTitles and CandidateTitleTokens")
+    #for col in ("HistoryTitles", "CandidateTitleTokens"):
+    #    out[col] = out[col].to_pylist().apply(lambda x: np.asarray(x, dtype="int32"))
+    #print(f"finshed processing HistoryTitles and CandidateTitleTokens")
+    #path = _fname("Hist_full")
+    #out.to_parquet(path, engine="pyarrow", compression=compression, index=False)
+    #out.to_parquet(path, engine="pyarrow", row_group_size=100_000)
+    path = _fname("Hist_full")
+    process_and_to_parquet(out, path)
+
+    # last-k variants
+    for k in ks:
+        out = base.copy()
+        out["HistoryTitles"] = out["HistIDs"].map(partial(_slice_history,
+                                                          keep=k))
+        #out["HistoryTitles"]        = out["HistoryTitles"].astype("object")
+        #out["CandidateTitleTokens"] = out["CandidateTitleTokens"].astype("object")
+        path = _fname(f"Hist_k{k}")
+        process_and_to_parquet(out[keep_cols], path)
+        """
+        out[keep_cols].to_parquet(
+            _fname(f"Hist_k{k}"),
+            engine="pyarrow",
+            row_group_size=100_000,
+            compression="zstd")
+        """
+
+
+    # donor-swap variants
+    for p in pivots:
+        def _swap(row, pivot=p):
+            donor_part = row.DonorHist[-pivot:]
+            own_part   = row.HistIDs[-(max_hist - pivot):]
+            return donor_part + own_part
+        out = base.copy()
+        out["HistoryTitles"] = out.apply(_swap, axis=1)
+        path = _fname(f"Hist_swap{p}")
+        process_and_to_parquet(out[keep_cols], path)
+        #out["HistoryTitles"]        = out["HistoryTitles"].astype("object")
+        #out["CandidateTitleTokens"] = out["CandidateTitleTokens"].astype("object")
+        """
+        out[keep_cols].to_parquet(
+            _fname(f"Hist_swap{p}"),
+            engine="pyarrow",
+            row_group_size=100_000,
+            compression="zstd")
+        """
 
 class DataGenerator(Sequence):
     def __init__(self, df, batch_size, max_history_length=50, max_title_length=30):
@@ -2187,26 +2968,38 @@ class UserEncoder(Layer):
         )
         return cls(news_encoder_layer, **config)
 
-def build_model(vocab_size, max_title_length=30, max_history_length=50, embedding_dim=256, nb_head=8, size_per_head=32, dropout_rate=0.2):
+def build_model(vocab_size, max_title_length=30, max_history_length=50, embedding_dim=256, nb_head=8, size_per_head=32, dropout_rate=0.2, timed=False):
     # Define Inputs
     history_input = Input(shape=(max_history_length, max_title_length), dtype='int32', name='history_input')
     candidate_input = Input(shape=(max_title_length,), dtype='int32', name='candidate_input')
 
     # Instantiate NewsEncoder Layer
-    news_encoder_layer = NewsEncoder(
-        vocab_size=vocab_size,
-        embedding_dim=embedding_dim,
-        dropout_rate=dropout_rate,
-        nb_head=nb_head,
-        size_per_head=size_per_head,
-        name='news_encoder'
-    )
-
+    if timed:
+        news_encoder_layer = TimedNewsEncoder(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate,
+            nb_head=nb_head,
+            size_per_head=size_per_head,
+            name='news_encoder'
+        )
+    else:
+        news_encoder_layer = NewsEncoder(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate,
+            nb_head=nb_head,
+            size_per_head=size_per_head,
+            name='news_encoder'
+        )
     # Encode Candidate News
     candidate_vector = news_encoder_layer(candidate_input)  # Shape: (batch_size, embedding_dim)
 
     # Encode User History
-    user_vector = UserEncoder(news_encoder_layer, embedding_dim=embedding_dim, name='user_encoder')(history_input)  # Shape: (batch_size, embedding_dim)
+    if timed:
+        user_vector = TimedUserEncoder(news_encoder_layer, embedding_dim=embedding_dim, name='timed_user_encoder')(history_input)  # Shape: (batch_size, embedding_dim)
+    else:
+        user_vector = UserEncoder(news_encoder_layer, embedding_dim=embedding_dim, name='user_encoder')(history_input)  # Shape: (batch_size, embedding_dim)
 
     # Scoring Function: Dot Product between User and Candidate Vectors
     score = Dot(axes=-1)([user_vector, candidate_vector])  # Shape: (batch_size, 1)
@@ -2225,6 +3018,1128 @@ def build_model(vocab_size, max_title_length=30, max_history_length=50, embeddin
     )
 
     return model
+
+# ----------------------------
+# NRMS‐style NewsEncoder
+# ----------------------------
+@register_keras_serializable()
+class NewsEncoderNRMS(Layer):
+    def __init__(self,
+                 vocab_size,
+                 embedding_dim=256,
+                 num_heads=8,
+                 dropout_rate=0.2,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.embed = Embedding(vocab_size, embedding_dim, mask_zero=True)
+        self.dropout = Dropout(dropout_rate)
+        self.mha = MultiHeadAttention(num_heads=num_heads,
+                                      key_dim=embedding_dim//num_heads,
+                                      dropout=dropout_rate)
+        self.dense = Dense(1)
+        self.softmax = Softmax(axis=1)
+        self.squeeze = SqueezeLayer(-1)
+        self.expand = ExpandDimsLayer(-1)
+        self.sum_pool = SumPooling(1)
+
+    def call(self, x):
+        # x: [B, L]
+        mask = tf.cast(tf.not_equal(x, 0), tf.bool)            # [B, L]
+        emb = self.embed(x)                                    # [B, L, D]
+        emb = self.dropout(emb)
+        # self‐attention (query=key=emb)
+        attn_out = self.mha(query=emb, value=emb, key=emb,
+                            attention_mask=mask[:, tf.newaxis, :])  # [B, L, D]
+        attn_out = self.dropout(attn_out)
+        # attention pooling
+        scores = self.dense(attn_out)     # [B, L, 1]
+        scores = self.squeeze(scores)     # [B, L]
+        weights = self.softmax(scores)    # [B, L]
+        weights = self.expand(weights)    # [B, L, 1]
+        weighted = attn_out * weights     # [B, L, D]
+        return self.sum_pool(weighted)    # [B, D]
+
+# ----------------------------
+# NRMS‐style UserEncoder
+# ----------------------------
+from tensorflow.keras.layers import Layer, MultiHeadAttention, LayerNormalization, Dense
+import tensorflow as tf
+
+class oldUserEncoderNRMS(Layer):
+    def __init__(self, embed_dim, num_heads, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        # Create your MHA, layernorm, etc in __init__
+        self.mha = MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.embed_dim // self.num_heads,
+            name="user_mha"
+        )
+        self.layer_norm = LayerNormalization(name="user_ln")
+        self.dense = Dense(self.embed_dim, activation="tanh", name="user_dense")
+
+    def build(self, input_shape):
+        # input_shape will be (batch_size, history_len, embed_dim)
+        # by the time you call UserEncoderNRMS, news_encoder should already have
+        # turned your raw token IDs into embed vectors of size `embed_dim`.
+        # So here we just mark this layer as built.
+        super().build(input_shape)
+        # (No need to manually call self.mha.build — Keras will do it for you now
+        # that you've implemented build())
+
+    def call(self, history_embeddings):
+        # history_embeddings: Tensor [B, H, D]
+        # we'll do self-attention over the history:
+        attn_output = self.mha(
+            query=history_embeddings,
+            key=history_embeddings,
+            value=history_embeddings
+        )  # -> [B, H, D]
+        attn_output = self.layer_norm(attn_output + history_embeddings)
+        # pool across the H dimension to get a single user vector [B, D]
+        user_vec = tf.reduce_mean(attn_output, axis=1)
+        user_vec = self.dense(user_vec)
+        return user_vec  # shape [B, D]
+
+    def compute_output_shape(self, input_shape):
+        # we're collapsing the H dimension into the embedding dim
+        batch_size = input_shape[0]
+        return (batch_size, self.embed_dim)
+
+
+@register_keras_serializable()
+class oldUserEncoderNRMS(Layer):
+    def __init__(self,
+                 news_encoder: Layer,
+                 embedding_dim=256,
+                 num_heads=8,
+                 dropout_rate=0.2,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embedding_dim
+        self.num_heads = num_heads
+        # Create your MHA, layernorm, etc in __init__
+        #self.mha = MultiHeadAttention(
+        #    num_heads=self.num_heads,
+        #    key_dim=self.embed_dim // self.num_heads,
+        #    name="user_mha"
+        #)
+        self.layer_norm = LayerNormalization(name="user_ln")
+        #self.dense = Dense(self.embed_dim, activation="tanh", name="user_dense")
+        self.news_enc = news_encoder
+        self.mha = MultiHeadAttention(num_heads=num_heads,
+                                      key_dim=embedding_dim//num_heads,
+                                      dropout=dropout_rate)
+        self.dropout = Dropout(dropout_rate)
+        self.dense = Dense(1)
+        self.softmax = Softmax(axis=1)
+        self.squeeze = SqueezeLayer(-1)
+        self.expand = ExpandDimsLayer(-1)
+        self.sum_pool = SumPooling(1)
+
+    def build(self, input_shape):
+        # input_shape will be (batch_size, history_len, embed_dim)
+        # by the time you call UserEncoderNRMS, news_encoder should already have
+        # turned your raw token IDs into embed vectors of size `embed_dim`.
+        # So here we just mark this layer as built.
+        super().build(input_shape)
+        # (No need to manually call self.mha.build — Keras will do it for you now
+        # that you've implemented build())
+    def call(self, history_inputs):
+        # history_inputs: [B, H, L]
+        B, H, L = tf.shape(history_inputs)[0], tf.shape(history_inputs)[1], tf.shape(history_inputs)[2]
+        flat = tf.reshape(history_inputs, (-1, L))             # [B*H, L]
+        # encode each news in history
+        news_vecs = self.news_enc(flat)                        # [B*H, D]
+        news_vecs = tf.reshape(news_vecs, (B, H, -1))         # [B, H, D]
+        # build a mask: if a row is all-zero→False
+        mask = tf.reduce_any(tf.not_equal(history_inputs, 0), axis=-1)  # [B, H]
+        # self-attend across history
+        attn = self.mha(query=news_vecs, value=news_vecs, key=news_vecs,
+                        attention_mask=mask[:, tf.newaxis, :])       # [B, H, D]
+        attn = self.dropout(attn)
+        # pooling
+        scores = self.dense(attn)     # [B, H, 1]
+        scores = self.squeeze(scores) # [B, H]
+        weights = self.softmax(scores)# [B, H]
+        weights = self.expand(weights)# [B, H, 1]
+        weighted = attn * weights     # [B, H, D]
+        return self.sum_pool(weighted) # [B, D]
+    def compute_output_shape(self, input_shape):
+        # we're collapsing the H dimension into the embedding dim
+        batch_size = input_shape[0]
+        return (batch_size, self.embed_dim)
+# ----------------------------
+# build a combined NRMS model
+# ----------------------------
+from tensorflow.keras.optimizers import Adam
+
+
+
+import tensorflow as tf
+from tensorflow.keras.layers import Layer, Embedding, Dense, Softmax, LayerNormalization, MultiHeadAttention
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Layer
+
+class MaskedGlobalAvgPool(Layer):
+    def call(self, inputs, mask=None):
+        # inputs: (B, H, D), mask: (B, H) boolean or float
+        if mask is None:
+            # derive from zero‐padding if you like:
+            mask = tf.cast(tf.reduce_any(tf.not_equal(inputs, 0), axis=-1), tf.float32)
+        mask = tf.expand_dims(mask, axis=-1)           # (B, H, 1)
+        sums = tf.reduce_sum(inputs * mask, axis=1)    # (B, D)
+        lengths = tf.reduce_sum(mask, axis=1) + 1e-6    # (B, 1)
+        return sums / lengths                          # (B, D)
+
+
+class NewsEncoderNRMS(Layer):
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int = 256,
+        max_title_length: int = 30,
+        num_heads: int = 8,
+        key_dim: int = 32,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.max_title_length = max_title_length
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+
+        # sub-layers
+        self.embedding = Embedding(
+            input_dim=vocab_size,
+            output_dim=embedding_dim,
+            input_length=max_title_length,
+            mask_zero=True,
+            name="news_embed"
+        )
+        # NRMS uses a self-attention over the title tokens:
+        self.mha = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=key_dim,
+            name="news_mha"
+        )
+        self.layer_norm = LayerNormalization(name="news_ln")
+        self.attn_score = Dense(1, name="news_score")
+        self.softmax    = Softmax(axis=1, name="news_softmax")
+
+    def call(self, x, **kwargs):
+        # inputs: (batch_size, title_len)
+        from tensorflow.keras.layers import Lambda
+
+        # instead of:
+        #    mask = tf.cast(tf.not_equal(x, 0), tf.float32)
+        # do:
+        mask = Lambda(
+            lambda x: tf.cast(tf.not_equal(x, 0), tf.float32),
+            name="mask_hist"
+        )(inputs)
+        emb = self.embed(x)                                    # [B, L, D]
+        emb = self.dropout(emb)
+        # self‐attention (query=key=emb)
+        attn_out = self.mha(query=emb, value=emb, key=emb,
+                            attention_mask=mask[:, tf.newaxis, :])  # [B, L, D]
+        # self-attention: query/value/key all = x
+        """
+        #x = self.embedding(inputs)                              # (B, L, D)
+        #q = self.mha(query=x, value=x, key=x)                   # (B, L, D)
+        q = self.mha(
+            query=x, value=x, key=x,
+            attention_mask=mask[:, None, None, :]   # broadcast to (B, heads, T_q, T_k)
+        )
+        """
+        # score each token:
+        scores = tf.squeeze(self.attn_score(q), axis=-1)        # (B, L)
+        weights = self.softmax(scores)                          # (B, L)
+        weights = tf.expand_dims(weights, -1)                   # (B, L, 1)
+        # weighted sum → one vector per news
+        news_vec = tf.reduce_sum(q * weights, axis=1)           # (B, D)
+        return self.layer_norm(news_vec)                        # (B, D)
+
+    def compute_output_shape(self, input_shape):
+        # from (batch_size, L) → (batch_size, D)
+        return (input_shape[0], self.embedding_dim)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "vocab_size": self.vocab_size,
+            "embedding_dim": self.embedding_dim,
+            "max_title_length": self.max_title_length,
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+        })
+        return cfg
+
+
+class oldUserEncoderNRMS(Layer):
+    def __init__(
+        self,
+        news_encoder: NewsEncoderNRMS,
+        max_history_length: int = 50,
+        **kwargs
+    ):
+        super().__init__(**kwargs)
+        self.news_encoder = news_encoder
+        self.max_history_length = max_history_length
+
+        # user-level self-attention over the history vectors
+        self.mha_user = MultiHeadAttention(
+            num_heads=news_encoder.num_heads,
+            key_dim=news_encoder.key_dim,
+            name="user_mha"
+        )
+        self.layer_norm = LayerNormalization(name="user_ln")
+        self.attn_score = Dense(1, name="user_score")
+        self.softmax    = Softmax(axis=1, name="user_softmax")
+
+    def call(self, inputs, **kwargs):
+        # inputs: (batch_size, H, L)
+        B, H, L = tf.shape(inputs)[0], tf.shape(inputs)[1], tf.shape(inputs)[2]
+        # reshape to run news_encoder on each title separately
+        flat = tf.reshape(inputs, (-1, L))             # (B*H, L)
+        news_vecs = self.news_encoder(flat)             # (B*H, D)
+        news_vecs = tf.reshape(news_vecs, (B, H, -1))   # (B, H, D)
+
+        # user self-attention
+        u = self.mha_user(query=news_vecs, value=news_vecs, key=news_vecs)  # (B, H, D)
+        scores = tf.squeeze(self.attn_score(u), -1)    # (B, H)
+        weights = self.softmax(scores)                 # (B, H)
+        weights = tf.expand_dims(weights, -1)          # (B, H, 1)
+        user_vec = tf.reduce_sum(u * weights, axis=1)  # (B, D)
+        return self.layer_norm(user_vec)               # (B, D)
+
+    def compute_output_shape(self, input_shape):
+        # from (B, H, L) → (B, D)
+        return (input_shape[0], self.news_encoder.embedding_dim)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "news_encoder": tf.keras.utils.serialize_keras_object(self.news_encoder),
+            "max_history_length": self.max_history_length,
+        })
+        return cfg
+
+
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import Model
+from tensorflow.keras.layers import (
+    Input, Embedding, MultiHeadAttention,
+    GlobalAveragePooling1D, TimeDistributed,
+    Dot, Activation
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import Sequence, register_keras_serializable
+
+# ─── Data generator for NRMS ─────────────────────────────────────────────────────
+
+class DataGeneratorNRMS(Sequence):
+    def __init__(self, df, batch_size, max_history_length=50, max_title_length=30):
+        self.df = df.reset_index(drop=True)
+        self.batch_size = batch_size
+        self.max_h = max_history_length
+        self.max_t = max_title_length
+        self.indices = np.arange(len(self.df))
+
+    def __len__(self):
+        return int(np.ceil(len(self.df) / self.batch_size))
+
+    def __getitem__(self, idx):
+        batch_idx = self.indices[idx*self.batch_size:(idx+1)*self.batch_size]
+        batch = self.df.iloc[batch_idx]
+
+        H, T = self.max_h, self.max_t
+        hist_batch = np.zeros((len(batch), H, T), dtype='int32')
+        cand_batch = np.zeros((len(batch), T),     dtype='int32')
+        y_batch    = np.zeros((len(batch),),        dtype='float32')
+
+        for i, row in enumerate(batch.itertuples()):
+            # pad/truncate history
+            hist = row.HistoryTitles  # list[list[int]] length ≤ some H_i
+            # pad titles
+            hist = tf.keras.preprocessing.sequence.pad_sequences(
+                hist, maxlen=T, padding='post', truncating='post', value=0)
+            # pad history dimension
+            if hist.shape[0] < H:
+                pad = np.zeros((H - hist.shape[0], T), dtype='int32')
+                hist = np.vstack([pad, hist])
+            else:
+                hist = hist[-H:]
+            hist_batch[i] = hist
+
+            # candidate
+            cand = row.CandidateTitleTokens
+            cand = tf.keras.preprocessing.sequence.pad_sequences(
+                [cand], maxlen=T, padding='post', truncating='post', value=0)[0]
+            cand_batch[i] = cand
+
+            y_batch[i] = row.Label
+
+        return {'history_input': hist_batch, 'candidate_input': cand_batch}, y_batch
+
+
+import tensorflow as tf
+from tensorflow.keras.layers import Layer, Dropout, MultiHeadAttention
+from tensorflow.keras.utils import register_keras_serializable
+
+
+@register_keras_serializable()
+class NRMSBlock(Layer):
+    def __init__(self, nb_head, size_per_head, dropout_rate=0.2, **kwargs):
+        super().__init__(**kwargs)
+        self.mha = MultiHeadAttention(
+            num_heads=nb_head,
+            key_dim=size_per_head,
+            dropout=dropout_rate,
+            name=self.name + "_mha"
+        )
+        self.dropout = Dropout(dropout_rate, name=self.name + "_dropout")
+
+    def call(self, inputs):
+        # unpack
+        if len(inputs) == 4:
+            Q_seq, K_seq, Q_mask_2d, K_mask_2d = inputs
+        else:
+            Q_seq, K_seq = inputs
+            Q_mask_2d = K_mask_2d = None
+
+        # if they gave you a 2D boolean mask, expand it to 3D:
+        #   mask_2d: (batch, seq_len)
+        #   ⇒ mask_3d: (batch, seq_len, seq_len)
+        if K_mask_2d is not None:
+            # make sure it's boolean
+            K_mask_2d = tf.cast(K_mask_2d, tf.bool)
+            # row‐ and column‐wise AND to get a [batch, q_len, k_len] mask
+            mask_3d = tf.logical_and(
+                tf.expand_dims(K_mask_2d, axis=1),    # (batch,1,k_len)
+                tf.expand_dims(K_mask_2d, axis=2)     # (batch,q_len,1)
+            )
+        else:
+            mask_3d = None
+
+        attn_out = self.mha(
+            query=Q_seq,
+            value=K_seq,
+            key=K_seq,
+            attention_mask=mask_3d,    # now shape=(batch, q_len, k_len)
+            return_attention_scores=False
+        )
+        return self.dropout(attn_out)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "nb_head": self.mha.num_heads,
+            "size_per_head": self.mha.key_dim,
+            "dropout_rate": self.dropout.rate,
+        })
+        return cfg
+
+
+@register_keras_serializable()
+class NewsEncoderNRMS(Layer):
+    def __init__(self, vocab_size, embedding_dim=256, dropout_rate=0.2, nb_head=8, size_per_head=32, embedding_layer=None, **kwargs):
+        super(NewsEncoderNRMS, self).__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.dropout_rate = dropout_rate
+        self.nb_head = nb_head
+        self.size_per_head = size_per_head
+
+        # Define sub-layers
+        self.embedding_layer = Embedding(
+            input_dim=self.vocab_size,
+            output_dim=self.embedding_dim,
+            name='embedding_layer'
+        )
+        self.dropout = Dropout(self.dropout_rate)
+        self.dense = Dense(1)
+        self.softmax = Softmax(axis=1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+
+        #self.fastformer_layer = Fastformer(nb_head=self.nb_head, size_per_head=self.size_per_head, name='fastformer_layer')
+        self.nrms_layer = NRMSBlock(
+            nb_head=self.nb_head,
+            size_per_head=self.size_per_head,
+            dropout_rate=self.dropout_rate,
+            name="nrms_layer"
+        )
+    def build(self, input_shape):
+        super(NewsEncoderNRMS, self).build(input_shape)
+
+    def call(self, inputs):
+        # Create mask
+        #mask = tf.cast(tf.not_equal(inputs, 0), dtype='float32')  # Shape: (batch_size, seq_len)
+        mask = tf.not_equal(inputs, 0)
+        # Embedding
+        title_emb = self.embedding_layer(inputs)  # Shape: (batch_size, seq_len, embedding_dim)
+        title_emb = self.dropout(title_emb)
+
+        # Fastformer
+        #hidden_emb = self.fastformer_layer([title_emb, title_emb, mask, mask])  # Shape: (batch_size, seq_len, embedding_dim)
+        #mha_mask = tf.reshape(mask, [tf.shape(mask)[0], 1, 1, tf.shape(mask)[1]])
+
+        # 4) apply your NRMS self‐attention block
+        hidden_emb = self.nrms_layer([title_emb, title_emb, mask, mask])
+    
+
+
+
+        hidden_emb = self.dropout(hidden_emb)
+
+        # Attention-based Pooling
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, seq_len, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, seq_len, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, seq_len, embedding_dim)
+        news_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+
+        return news_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(NewsEncoderNRMS, self).get_config()
+        config.update({
+            'vocab_size': self.vocab_size,
+            'embedding_dim': self.embedding_dim,
+            'dropout_rate': self.dropout_rate,
+            'nb_head': self.nb_head,
+            'size_per_head': self.size_per_head,
+            'embedding_layer': tf.keras.utils.serialize_keras_object(self.embedding_layer)
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        embedding_layer_config = config.pop('embedding_layer', None)
+        embedding_layer = tf.keras.layers.deserialize(embedding_layer_config) if embedding_layer_config else None
+        return cls(embedding_layer=embedding_layer, **config)
+
+@register_keras_serializable()
+class MaskLayer(Layer):
+    def __init__(self, **kwargs):
+        super(MaskLayer, self).__init__(**kwargs)
+
+    def call(self, inputs):
+        mask = tf.cast(tf.not_equal(inputs, 0), dtype='float32')
+        return mask
+
+    def get_config(self):
+        config = super(MaskLayer, self).get_config()
+        return config
+
+@register_keras_serializable()
+class UserEncoderNRMS(Layer):
+    def __init__(self, news_encoder_layer, embedding_dim=256, **kwargs):
+        super(UserEncoderNRMS, self).__init__(**kwargs)
+        self.news_encoder_layer = news_encoder_layer
+        self.embedding_dim = embedding_dim
+        self.dropout = Dropout(0.2)
+        self.layer_norm = LayerNormalization()
+        #self.fastformer = Fastformer(nb_head=8, size_per_head=32, name='user_fastformer')
+        self.nrms_layer = NRMSBlock(
+            nb_head=8,
+            size_per_head=32,
+            name="user_nrms_layer"
+        )
+        self.dense = Dense(1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.softmax = Softmax(axis=1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+
+    def call(self, inputs):
+        # inputs: (batch_size, MAX_HISTORY_LENGTH, MAX_TITLE_LENGTH)
+        # Encode each news article in the history
+        #news_vectors = TimeDistributed(self.news_encoder_layer)(inputs)  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+
+        # Step 1: Create a boolean mask
+        #mask = tf.not_equal(inputs, 0)  # Shape: (batch_size, MAX_HISTORY_LENGTH, MAX_TITLE_LENGTH), dtype=bool
+
+        # Step 2: Reduce along the last axis
+        #mask = tf.reduce_any(mask, axis=-1)  # Shape: (batch_size, MAX_HISTORY_LENGTH), dtype=bool
+
+        # Step 3: Cast to float32 if needed
+        #mask = tf.cast(mask, dtype='float32')  # Shape: (batch_size, MAX_HISTORY_LENGTH), dtype=float32
+
+        # Fastformer
+        #hidden_emb = self.fastformer([news_vectors, news_vectors, mask, mask])  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        #hidden_emb = self.nrms_layer([news_vectors, news_vectors, mask, mask])
+
+
+        #news_vectors = TimeDistributed(self.news_encoder_layer)(inputs)  # [batch, H, D]
+        #mask_h = tf.reduce_any(tf.not_equal(inputs, 0), axis=-1)         # bool, shape=(batch, H)
+
+        #hidden_emb = self.nrms_layer([news_vectors, news_vectors, mask_h, mask_h])
+
+        news_vecs = TimeDistributed(self.news_encoder_layer)(inputs)  # [batch, H, D]
+
+        # 2) bool mask over history positions
+        mask_h = tf.reduce_any(tf.not_equal(inputs, 0), axis=-1)       # bool [batch, H]
+
+        # 3) self-attend over history with that mask
+        hidden_emb = self.nrms_layer([news_vecs, news_vecs, mask_h, mask_h])    # [batch, H, D]
+
+        hidden_emb = self.dropout(hidden_emb)
+        hidden_emb = self.layer_norm(hidden_emb)
+
+        # Attention-based Pooling over history
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        user_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+
+        return user_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(UserEncoderNRMS, self).get_config()
+        config.update({
+            'embedding_dim': self.embedding_dim,
+            'news_encoder_layer': tf.keras.utils.serialize_keras_object(self.news_encoder_layer),
+        })
+        return config
+    @classmethod
+    def from_config(cls, config):
+        # Extract the serialized news_encoder_layer config
+        news_encoder_config = config.pop("news_encoder_layer")
+        # Reconstruct the news_encoder_layer instance
+        news_encoder_layer = tf.keras.utils.deserialize_keras_object(
+            news_encoder_config, custom_objects={'NewsEncoderNRMS': NewsEncoderNRMS}
+        )
+        return cls(news_encoder_layer, **config)
+
+
+
+@register_keras_serializable()
+class TimedNRMSBlock(Layer):
+    def __init__(self, nb_head, size_per_head, dropout_rate=0.2, **kwargs):
+        super().__init__(**kwargs)
+        self.mha = MultiHeadAttention(
+            num_heads=nb_head,
+            key_dim=size_per_head,
+            dropout=dropout_rate,
+            name=self.name + "_mha"
+        )
+        self.dropout = Dropout(dropout_rate, name=self.name + "_dropout")
+
+    def call(self, inputs):
+        # unpack
+        timings = {}
+        t0 = time.perf_counter()
+        if len(inputs) == 4:
+            Q_seq, K_seq, Q_mask_2d, K_mask_2d = inputs
+        else:
+            Q_seq, K_seq = inputs
+            Q_mask_2d = K_mask_2d = None
+
+        # if they gave you a 2D boolean mask, expand it to 3D:
+        #   mask_2d: (batch, seq_len)
+        #   ⇒ mask_3d: (batch, seq_len, seq_len)
+        if K_mask_2d is not None:
+            # make sure it's boolean
+            K_mask_2d = tf.cast(K_mask_2d, tf.bool)
+            # row‐ and column‐wise AND to get a [batch, q_len, k_len] mask
+            mask_3d = tf.logical_and(
+                tf.expand_dims(K_mask_2d, axis=1),    # (batch,1,k_len)
+                tf.expand_dims(K_mask_2d, axis=2)     # (batch,q_len,1)
+            )
+        else:
+            mask_3d = None
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        attn_out = self.mha(
+            query=Q_seq,
+            value=K_seq,
+            key=K_seq,
+            attention_mask=mask_3d,    # now shape=(batch, q_len, k_len)
+            return_attention_scores=False
+        )
+        timings['mha'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        output = self.dropout(attn_out)
+        timings['drop'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+
+        return output
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "nb_head": self.mha.num_heads,
+            "size_per_head": self.mha.key_dim,
+            "dropout_rate": self.dropout.rate,
+        })
+        return cfg
+
+@register_keras_serializable()
+class TimedFastformer(Layer):
+    def __init__(self, nb_head, size_per_head, **kwargs):
+        super(TimedFastformer, self).__init__(**kwargs)
+        self.nb_head = nb_head
+        self.size_per_head = size_per_head
+        self.output_dim = nb_head * size_per_head
+
+        self.WQ = None
+        self.WK = None
+        self.WV = None
+        self.WO = None
+
+    def build(self, input_shape):
+        self.WQ = Dense(self.output_dim, use_bias=False, name='WQ')
+        self.WK = Dense(self.output_dim, use_bias=False, name='WK')
+        self.WV = Dense(self.output_dim, use_bias=False, name='WV')
+        self.WO = Dense(self.output_dim, use_bias=False, name='WO')
+        super(TimedFastformer, self).build(input_shape)
+
+    def call(self, inputs):
+        timings = {}
+        t0 = time.perf_counter()
+        if len(inputs) == 2:
+            Q_seq, K_seq = inputs
+            Q_mask = None
+            K_mask = None
+        elif len(inputs) == 4:
+            Q_seq, K_seq, Q_mask, K_mask = inputs
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        batch_size = tf.shape(Q_seq)[0]
+        seq_len = tf.shape(Q_seq)[1]
+
+        # Linear projections
+        Q = self.WQ(Q_seq)  # Shape: (batch_size, seq_len, output_dim)
+        K = self.WK(K_seq)  # Shape: (batch_size, seq_len, output_dim)
+        V = self.WV(K_seq)  # Shape: (batch_size, seq_len, output_dim)
+
+        # Reshape for multi-head attention
+        Q = tf.reshape(Q, (batch_size, seq_len, self.nb_head, self.size_per_head))
+        K = tf.reshape(K, (batch_size, seq_len, self.nb_head, self.size_per_head))
+        V = tf.reshape(V, (batch_size, seq_len, self.nb_head, self.size_per_head))
+
+        # Compute global query and key
+        global_q = tf.reduce_mean(Q, axis=1, keepdims=True)  # (batch_size, 1, nb_head, size_per_head)
+        global_k = tf.reduce_mean(K, axis=1, keepdims=True)  # (batch_size, 1, nb_head, size_per_head)
+
+        # Compute attention weights
+        weights = global_q * K + global_k * Q  # (batch_size, seq_len, nb_head, size_per_head)
+        weights = tf.reduce_sum(weights, axis=-1)  # (batch_size, seq_len, nb_head)
+        weights = tf.nn.softmax(weights, axis=1)  # Softmax over seq_len
+
+        # Apply attention weights to values
+        weights = tf.expand_dims(weights, axis=-1)  # (batch_size, seq_len, nb_head, 1)
+        context = weights * V  # (batch_size, seq_len, nb_head, size_per_head)
+
+        # Combine heads
+        context = tf.reshape(context, (batch_size, seq_len, self.output_dim))
+
+        # Final projection
+        output = self.WO(context)  # (batch_size, seq_len, output_dim)
+        timings['fastformer_mha'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+
+        return output  # Output shape: (batch_size, seq_len, output_dim)
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[1], self.output_dim)
+
+    def get_config(self):
+        config = super(TimedFastformer, self).get_config()
+        config.update({
+            'nb_head': self.nb_head,
+            'size_per_head': self.size_per_head
+        })
+        return config
+
+
+@register_keras_serializable()
+class TimedNewsEncoderNRMS(Layer):
+    def __init__(self, vocab_size, embedding_dim=256, dropout_rate=0.2, nb_head=8, size_per_head=32, embedding_layer=None, **kwargs):
+        super(TimedNewsEncoderNRMS, self).__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.dropout_rate = dropout_rate
+        self.nb_head = nb_head
+        self.size_per_head = size_per_head
+
+        # Define sub-layers
+        self.embedding_layer = Embedding(
+            input_dim=self.vocab_size,
+            output_dim=self.embedding_dim,
+            name='embedding_layer'
+        )
+        self.dropout = Dropout(self.dropout_rate)
+        self.dense = Dense(1)
+        self.softmax = Softmax(axis=1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+
+        #self.TimedFastformer_layer = TimedFastformer(nb_head=self.nb_head, size_per_head=self.size_per_head, name='TimedFastformer_layer')
+        self.nrms_layer = TimedNRMSBlock(
+            nb_head=self.nb_head,
+            size_per_head=self.size_per_head,
+            dropout_rate=self.dropout_rate,
+            name="nrms_layer"
+        )
+    def build(self, input_shape):
+        super(TimedNewsEncoderNRMS, self).build(input_shape)
+
+    def call(self, inputs):
+        # Create mask
+
+        timings = {}
+        t0 = time.perf_counter()
+        mask = tf.not_equal(inputs, 0)
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+        # Embedding
+        t0 = time.perf_counter()
+        title_emb = self.embedding_layer(inputs)  # Shape: (batch_size, seq_len, embedding_dim)
+        title_emb = self.dropout(title_emb)
+        timings['title_emb'] = (time.perf_counter() - t0) * 1e3
+
+        # TimedFastformer
+        #hidden_emb = self.TimedFastformer_layer([title_emb, title_emb, mask, mask])  # Shape: (batch_size, seq_len, embedding_dim)
+        #mha_mask = tf.reshape(mask, [tf.shape(mask)[0], 1, 1, tf.shape(mask)[1]])
+
+        # 4) apply your NRMS self‐attention block
+        t0 = time.perf_counter()
+        hidden_emb = self.nrms_layer([title_emb, title_emb, mask, mask])
+        timings['news_encoder_nrms'] = (time.perf_counter() - t0) * 1e3
+    
+
+
+
+        t0 = time.perf_counter()
+        hidden_emb = self.dropout(hidden_emb)
+        timings['drop'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        # Attention-based Pooling
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, seq_len, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, seq_len, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, seq_len, embedding_dim)
+        news_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+        timings['attn_pool'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+
+        return news_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(TimedNewsEncoderNRMS, self).get_config()
+        config.update({
+            'vocab_size': self.vocab_size,
+            'embedding_dim': self.embedding_dim,
+            'dropout_rate': self.dropout_rate,
+            'nb_head': self.nb_head,
+            'size_per_head': self.size_per_head,
+            'embedding_layer': tf.keras.utils.serialize_keras_object(self.embedding_layer)
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        embedding_layer_config = config.pop('embedding_layer', None)
+        embedding_layer = tf.keras.layers.deserialize(embedding_layer_config) if embedding_layer_config else None
+        return cls(embedding_layer=embedding_layer, **config)
+
+
+@register_keras_serializable()
+class TimedUserEncoderNRMS(Layer):
+    def __init__(self, news_encoder_layer, embedding_dim=256, **kwargs):
+        super(TimedUserEncoderNRMS, self).__init__(**kwargs)
+        self.news_encoder_layer = news_encoder_layer
+        self.embedding_dim = embedding_dim
+        self.dropout = Dropout(0.2)
+        self.layer_norm = LayerNormalization()
+        #self.TimedFastformer = TimedFastformer(nb_head=8, size_per_head=32, name='user_TimedFastformer')
+        self.nrms_layer = TimedNRMSBlock(
+            nb_head=8,
+            size_per_head=32,
+            name="user_nrms_layer"
+        )
+        self.dense = Dense(1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.softmax = Softmax(axis=1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+
+    def call(self, inputs):
+        # inputs: (batch_size, MAX_HISTORY_LENGTH, MAX_TITLE_LENGTH)
+
+        timings = {}
+        t0 = time.perf_counter()
+        news_vecs = TimeDistributed(self.news_encoder_layer)(inputs)  # [batch, H, D]
+        timings['encode_hist'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        # 2) bool mask over history positions
+        mask_h = tf.reduce_any(tf.not_equal(inputs, 0), axis=-1)       # bool [batch, H]
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+
+        # 3) self-attend over history with that mask
+        t0 = time.perf_counter()
+        hidden_emb = self.nrms_layer([news_vecs, news_vecs, mask_h, mask_h])    # [batch, H, D]
+        timings['user_encoder_nrms'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        hidden_emb = self.dropout(hidden_emb)
+        hidden_emb = self.layer_norm(hidden_emb)
+        timings['drop_norm'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        # Attention-based Pooling over history
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        user_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+        timings['attn_pool'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+
+        return user_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(TimedUserEncoderNRMS, self).get_config()
+        config.update({
+            'embedding_dim': self.embedding_dim,
+            'news_encoder_layer': tf.keras.utils.serialize_keras_object(self.news_encoder_layer),
+        })
+        return config
+    @classmethod
+    def from_config(cls, config):
+        # Extract the serialized news_encoder_layer config
+        news_encoder_config = config.pop("news_encoder_layer")
+        # Reconstruct the news_encoder_layer instance
+        news_encoder_layer = tf.keras.utils.deserialize_keras_object(
+            news_encoder_config, custom_objects={'TimedNewsEncoderNRMS': TimedNewsEncoderNRMS}
+        )
+        return cls(news_encoder_layer, **config)
+
+
+
+@register_keras_serializable()
+class TimedNewsEncoder(Layer):
+    def __init__(self, vocab_size, embedding_dim=256, dropout_rate=0.2, nb_head=8, size_per_head=32, embedding_layer=None, **kwargs):
+        super(TimedNewsEncoder, self).__init__(**kwargs)
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.dropout_rate = dropout_rate
+        self.nb_head = nb_head
+        self.size_per_head = size_per_head
+
+        # Define sub-layers
+        self.embedding_layer = Embedding(
+            input_dim=self.vocab_size,
+            output_dim=self.embedding_dim,
+            name='embedding_layer'
+        )
+        self.dropout = Dropout(self.dropout_rate)
+        self.dense = Dense(1)
+        self.softmax = Softmax(axis=1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+
+        self.fastformer_layer = TimedFastformer(nb_head=self.nb_head, size_per_head=self.size_per_head, name='fastformer_layer')
+
+    def build(self, input_shape):
+        super(TimedNewsEncoder, self).build(input_shape)
+
+    def call(self, inputs):
+        # Create mask
+        timings = {}
+        t0 = time.perf_counter()
+        mask = tf.cast(tf.not_equal(inputs, 0), dtype='float32')  # Shape: (batch_size, seq_len)
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+
+        # Embedding
+        t0 = time.perf_counter()
+        title_emb = self.embedding_layer(inputs)  # Shape: (batch_size, seq_len, embedding_dim)
+        title_emb = self.dropout(title_emb)
+        timings['title_emb'] = (time.perf_counter() - t0) * 1e3
+
+        # Fastformer
+        t0 = time.perf_counter()
+        hidden_emb = self.fastformer_layer([title_emb, title_emb, mask, mask])  # Shape: (batch_size, seq_len, embedding_dim)
+        timings['news_encoder_fastformer'] = (time.perf_counter() - t0) * 1e3
+        t0 = time.perf_counter()
+        hidden_emb = self.dropout(hidden_emb)
+        timings['drop'] = (time.perf_counter() - t0) * 1e3
+
+        # Attention-based Pooling
+        t0 = time.perf_counter()
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, seq_len, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, seq_len)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, seq_len, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, seq_len, embedding_dim)
+        news_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+        timings['attn_pool'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+
+        return news_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(TimedNewsEncoder, self).get_config()
+        config.update({
+            'vocab_size': self.vocab_size,
+            'embedding_dim': self.embedding_dim,
+            'dropout_rate': self.dropout_rate,
+            'nb_head': self.nb_head,
+            'size_per_head': self.size_per_head,
+            'embedding_layer': tf.keras.utils.serialize_keras_object(self.embedding_layer)
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        embedding_layer_config = config.pop('embedding_layer', None)
+        embedding_layer = tf.keras.layers.deserialize(embedding_layer_config) if embedding_layer_config else None
+        return cls(embedding_layer=embedding_layer, **config)
+
+
+
+@register_keras_serializable()
+class TimedUserEncoder(Layer):
+    def __init__(self, news_encoder_layer, embedding_dim=256, **kwargs):
+        super(TimedUserEncoder, self).__init__(**kwargs)
+        self.news_encoder_layer = news_encoder_layer
+        self.embedding_dim = embedding_dim
+        self.dropout = Dropout(0.2)
+        self.layer_norm = LayerNormalization()
+        self.fastformer = TimedFastformer(nb_head=8, size_per_head=32, name='user_fastformer')
+        self.dense = Dense(1)
+        self.squeeze = SqueezeLayer(axis=-1)
+        self.softmax = Softmax(axis=1)
+        self.expand_dims = ExpandDimsLayer(axis=-1)
+        self.sum_pooling = SumPooling(axis=1)
+    #@tf.function
+    def call(self, inputs):
+        # inputs: (batch_size, MAX_HISTORY_LENGTH, MAX_TITLE_LENGTH)
+        timings = {}
+        # Encode each news article in the history
+        t0 = time.perf_counter()
+        news_vectors = TimeDistributed(self.news_encoder_layer)(inputs)  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        timings['encode_hist'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        mask = tf.not_equal(inputs, 0)  # Shape: (batch_size, MAX_HISTORY_LENGTH, MAX_TITLE_LENGTH), dtype=bool
+        mask = tf.reduce_any(mask, axis=-1)  # Shape: (batch_size, MAX_HISTORY_LENGTH), dtype=bool
+        mask = tf.cast(mask, dtype='float32')  # Shape: (batch_size, MAX_HISTORY_LENGTH), dtype=float32
+        timings['make_mask'] = (time.perf_counter() - t0) * 1e3
+
+        # Fastformer
+        t0 = time.perf_counter()
+        hidden_emb = self.fastformer([news_vectors, news_vectors, mask, mask])  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        timings['user_encoder_fastformer'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        hidden_emb = self.dropout(hidden_emb)
+        hidden_emb = self.layer_norm(hidden_emb)
+        timings['drop_norm'] = (time.perf_counter() - t0) * 1e3
+
+        t0 = time.perf_counter()
+        # Attention-based Pooling over history
+        attention_scores = self.dense(hidden_emb)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        attention_scores = self.squeeze(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.softmax(attention_scores)  # Shape: (batch_size, MAX_HISTORY_LENGTH)
+        attention_weights = self.expand_dims(attention_weights)  # Shape: (batch_size, MAX_HISTORY_LENGTH, 1)
+        multiplied = Multiply()([hidden_emb, attention_weights])  # Shape: (batch_size, MAX_HISTORY_LENGTH, embedding_dim)
+        user_vector = self.sum_pooling(multiplied)  # Shape: (batch_size, embedding_dim)
+        timings['attn_pool'] = (time.perf_counter() - t0) * 1e3
+        print_to_file({k: f"{v:.1f}ms" for k, v in timings.items()}, 'logs/timings.log')
+        #tf.print({k: f"{v:.1f}ms" for k, v in timings.items()})
+
+        return user_vector  # Shape: (batch_size, embedding_dim)
+
+    def get_config(self):
+        config = super(TimedUserEncoder, self).get_config()
+        config.update({
+            'embedding_dim': self.embedding_dim,
+            'news_encoder_layer': tf.keras.utils.serialize_keras_object(self.news_encoder_layer),
+        })
+        return config
+    @classmethod
+    def from_config(cls, config):
+        # Extract the serialized news_encoder_layer config
+        news_encoder_config = config.pop("news_encoder_layer")
+        # Reconstruct the news_encoder_layer instance
+        news_encoder_layer = tf.keras.utils.deserialize_keras_object(
+            news_encoder_config, custom_objects={'TimedNewsEncoder': TimedNewsEncoder}
+        )
+        return cls(news_encoder_layer, **config)
+
+
+def build_nrms_model(vocab_size, max_title_length=30, max_history_length=50, embedding_dim=256, nb_head=8, size_per_head=32, dropout_rate=0.2, timed=False):
+    # Define Inputs
+    history_input = Input(shape=(max_history_length, max_title_length), dtype='int32', name='history_input')
+    candidate_input = Input(shape=(max_title_length,), dtype='int32', name='candidate_input')
+
+    # Instantiate NewsEncoder Layer
+    if timed:
+        news_encoder_layer = TimedNewsEncoderNRMS(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate,
+            nb_head=nb_head,
+            size_per_head=size_per_head,
+            name='news_encoder'
+        )
+    else:
+        news_encoder_layer = NewsEncoderNRMS(
+            vocab_size=vocab_size,
+            embedding_dim=embedding_dim,
+            dropout_rate=dropout_rate,
+            nb_head=nb_head,
+            size_per_head=size_per_head,
+            name='news_encoder'
+        )
+
+    # Encode Candidate News
+    candidate_vector = news_encoder_layer(candidate_input)  # Shape: (batch_size, embedding_dim)
+
+    # Encode User History
+    if timed:
+        user_vector = TimedUserEncoderNRMS(news_encoder_layer, embedding_dim=embedding_dim, name='user_encoder')(history_input)  # Shape: (batch_size, embedding_dim)
+    else:
+        user_vector = UserEncoderNRMS(news_encoder_layer, embedding_dim=embedding_dim, name='user_encoder')(history_input)  # Shape: (batch_size, embedding_dim)
+
+    # Scoring Function: Dot Product between User and Candidate Vectors
+    score = Dot(axes=-1)([user_vector, candidate_vector])  # Shape: (batch_size, 1)
+    score = Activation('sigmoid')(score)  # Shape: (batch_size, 1)
+
+    # Build Model
+    model = Model(inputs={'history_input': history_input, 'candidate_input': candidate_input}, outputs=score)
+    model.compile(
+        loss='binary_crossentropy',
+        optimizer=Adam(learning_rate=0.001),
+        metrics=[
+            tf.keras.metrics.Precision(name='precision'),
+            tf.keras.metrics.Recall(name='recall'),
+            tf.keras.metrics.AUC(name='AUC')
+        ]
+    )
+
+    return model
+
 
 def build_and_load_weights(weights_file):
      print("""Building model: build_model(
@@ -2258,8 +4173,12 @@ def build_and_load_weights(weights_file):
      #model.build(input_shapes)
      model.load_weights(weights_file)
      return model
-
-def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters, batch_size=64, epochs=5, load_models=[], retrain=False, size='large', train_part=0.8, model_base=''):
+    
+def glob_size_variants(template, root = Path(".")):
+    glob_pattern = re.sub(r'\b(?:small|large)\b', '*', template)
+    return sorted(root.glob(glob_pattern))
+def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters, batch_size=64, epochs=5, load_models=[], retrain=False, size='large', train_part=0.8,
+    model_base='', dataset_size='small', dataset='train', test_size=-0.1, load_all_sizes=False):
     models = {}
     model_dir = "models"    
     for cluster in range(num_clusters):
@@ -2270,6 +4189,7 @@ def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_leng
         weights_file = f'{model_dir}/{m_name}.weights.h5'
         model_file = f'{model_dir}/{m_name}.keras'
         model_h5_file = f'{model_dir}/{m_name}.h5'
+        finedtuned_model_h5_file = f'{model_dir}/{m_name}_tuned_{dataset}_{dataset_size}_tsize_{test_size}.h5'
         model_hdf5_file = f'{model_dir}/{m_name}.hdf5'
         model_json_file = f'{model_dir}/{m_name}.json'
         #if cluster in load_models: # load_models should be list of number indicating which models to load and not train
@@ -2279,22 +4199,44 @@ def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_leng
         #        filename=model_file,
         #        local_dir=model_dir
         #    )
-        model_path = model_h5_file
+        if dataset == 'valid' and os.path.exists(finedtuned_model_h5_file):
+            model_path = finedtuned_model_h5_file #
+        else:
+            model_path = model_h5_file
         if os.path.exists(model_path) and not retrain:
             print(f"Loading model: {model_path}")
             print(tf.__version__)
             print(keras.__version__)
-            with custom_object_scope({'UserEncoder': UserEncoder, 'NewsEncoder': NewsEncoder}):
-                model = tf.keras.models.load_model(model_path)#build_and_load_weights(weights_file)
-                models[f"{cluster}_{size}"] = model
+            if load_all_sizes:
+                for p in glob_size_variants(model_path):
+                    if f"{cluster}_large" in p and "tuned" not in p:
+                        continue # large models should be finetuned so skip non tuned large models
+                    log_print(f"loading model p:{p}")
+                    with custom_object_scope({'UserEncoder': UserEncoder, 'NewsEncoder': NewsEncoder}):
+                        model = tf.keras.models.load_model(p)
+                        key = f"{cluster}_large" if f"{cluster}_large" in p else f"{cluster}_small"
+                        models[f"{cluster}_{size}"] = model
+                continue # load all models not training so continue
+            else:
+                with custom_object_scope({'UserEncoder': UserEncoder, 'NewsEncoder': NewsEncoder}):
+                    model = tf.keras.models.load_model(model_path)#build_and_load_weights(weights_file)
+                    models[f"{cluster}_{size}"] = model
             #model.save(model_file)
             #print(f"Saved model for Cluster {cluster} into {model_file}.")
-            continue
+            if model_path == finedtuned_model_h5_file or size == 'small':
+                continue
+            elif dataset == 'valid': # Conditionally finetuning existing model
+                model_h5_file = finedtuned_model_h5_file
         
-        print(f"\nTraining model for Cluster {cluster} into {weights_file}")
+        print(f"\nTraining model for Cluster {cluster} into {model_h5_file}")
         # Retrieve training and validation data
         train_data = clustered_data[cluster]['train']
         val_data = clustered_data[cluster]['val']
+        if model_h5_file == finedtuned_model_h5_file: # fine tuning on non clusterized data
+            train_parts = [clustered_data[c]['train'] for c in clustered_data]
+            val_parts   = [clustered_data[c]['val']   for c in clustered_data]
+            train_data = pd.concat(train_parts, ignore_index=True)
+            val_data   = pd.concat(val_parts,   ignore_index=True)
 
         print(f"Cluster {cluster} - Training samples: {len(train_data)}, Validation samples: {len(val_data)}")
 
@@ -2348,12 +4290,12 @@ def train_cluster_models(clustered_data, tokenizer, vocab_size, max_history_leng
         )
 
         # Save model weights
-        model.save_weights(weights_file)
-        print(f"Saved model weights for Cluster {cluster} into {weights_file}.")
+        #model.save_weights(weights_file)
+        #print(f"Saved model weights for Cluster {cluster} into {weights_file}.")
         model.save(model_h5_file)
         print(f"Saved h5 model for Cluster {cluster} into {model_h5_file}.")
-        model.save(model_file)
-        print(f"Saved model for Cluster {cluster} into {model_file}.")
+        #model.save(model_file)
+        #print(f"Saved model for Cluster {cluster} into {model_file}.")
 
         # Store the model
         models[f"{cluster}_{size}"] = model
@@ -2382,7 +4324,7 @@ class SaveEveryN(tf.keras.callbacks.Callback):
             print(f"[ckpt] saved {fname}")
 
 
-def resume_or_build_h5(model_dir, build_fn, steps_per_epoch):
+def resume_or_build_h5(model_dir, build_fn, steps_per_epoch, timed=False):
     pattern = os.path.join(model_dir, "*_ckpt_batch*.h5")
     ckpts   = glob.glob(pattern)
     if not ckpts:
@@ -2396,8 +4338,9 @@ def resume_or_build_h5(model_dir, build_fn, steps_per_epoch):
     start_epoch  = batches_done // steps_per_epoch
 
     print(f"Resuming from {latest} (batch {batches_done}, epoch {start_epoch})")
-    model = load(latest, custom_objects=None)
+    model = load(latest, custom_objects=None, timed=timed)
     return model, start_epoch
+
 
 def train_global_model(
     train_data,
@@ -2411,13 +4354,14 @@ def train_global_model(
     val_data=None,
     retrain=False,
     load_best_model=False,
-    load_checkpoint_model=False, model_base=''
+    load_checkpoint_model=False, model_base='', model_arc_type="fastformer", timed=False
 ):
+
     if model_base == '':
-        model_file_prefix=f"fastformer_global_{dataset_size}_balanced_{epochs}_epochs"
+        model_file_prefix=f"{model_arc_type}_global_{dataset_size}_balanced_{epochs}_epochs"
     else:
-        model_file_prefix = f'fastformer_global_{model_base}'
-    model_file_prefix=f"fastformer_global_{dataset_size}_balanced_{epochs}_epochs"
+        model_file_prefix = f'{model_arc_type}_global_{model_base}'
+    #model_file_prefix=f"{model_arc_type}_global_{dataset_size}_balanced_{epochs}_epochs"
     model_dir="models"
     weights_file = f'{model_dir}/{model_file_prefix}.weights.h5'
     best_model = f'{model_dir}/best_model_{model_file_prefix}.h5'
@@ -2430,7 +4374,42 @@ def train_global_model(
             load_file = best_model
         else:
             load_file = h5_file
-        model = load(load_file)
+        custom_objects = {
+            'UserEncoder': UserEncoder,
+            'NewsEncoder': NewsEncoder,
+        }
+        if timed:
+            custom_objects = {
+                'UserEncoder': TimedUserEncoder,
+                'NewsEncoder': TimedNewsEncoder,
+            }
+        if model_arc_type == "nrms":
+            custom_objects = {
+                'UserEncoderNRMS': UserEncoderNRMS,
+                'NewsEncoderNRMS': NewsEncoderNRMS,
+                'UserEncoder':    UserEncoder,
+                'NewsEncoder':    NewsEncoder,
+                'Fastformer':     Fastformer,
+                'SqueezeLayer':   SqueezeLayer,
+                'ExpandDimsLayer':ExpandDimsLayer,
+                'SumPooling':     SumPooling,
+                'MaskLayer':      MaskLayer,
+                'NotEqual':       tf.not_equal,
+            }
+            if timed:
+                custom_objects = {
+                    'UserEncoderNRMS': TimedUserEncoderNRMS,
+                    'NewsEncoderNRMS': TimedNewsEncoderNRMS,
+                    'UserEncoder':    TimedUserEncoder,
+                    'NewsEncoder':    TimedNewsEncoder,
+                    'Fastformer':     TimedFastformer,
+                    'SqueezeLayer':   SqueezeLayer,
+                    'ExpandDimsLayer':ExpandDimsLayer,
+                    'SumPooling':     SumPooling,
+                    'MaskLayer':      MaskLayer,
+                    'NotEqual':       tf.not_equal,
+                }
+        model = load(load_file, custom_objects, timed=timed)
         print(f"Loaded existing global model from {keras_file}")
         return model
     #train_data, val_data = train_test_split(train_df, test_size=0.2, random_state=42)
@@ -2439,20 +4418,35 @@ def train_global_model(
     #if val_data:
     #    val_generator = DataGenerator(val_data, batch_size=batch_size, max_history_length=max_history_length, max_title_length=max_title_length)
     steps_per_epoch = len(train_generator)
+    if model_arc_type == "fastformer":
+        model, start_epoch = resume_or_build_h5(
+            model_dir=model_dir,
+            build_fn=lambda: build_model(
+                vocab_size=vocab_size,
+                max_title_length=max_title_length,
+                max_history_length=max_history_length,
+                embedding_dim=256,
+                nb_head=8,
+                size_per_head=32,
+                dropout_rate=0.2,
+                timed=timed
+            ),
+            steps_per_epoch=steps_per_epoch
+        )
+    elif model_arc_type == "nrms":
+        start_epoch = 0
+        dg = DataGeneratorNRMS(train_data, batch_size, max_history_length=50, max_title_length=30)
 
-    model, start_epoch = resume_or_build_h5(
-        model_dir=model_dir,
-        build_fn=lambda: build_model(
-            vocab_size=vocab_size,
-            max_title_length=max_title_length,
-            max_history_length=max_history_length,
+        model = build_nrms_model(vocab_size,
+            max_title_length=30,
+            max_history_length=50,
             embedding_dim=256,
             nb_head=8,
             size_per_head=32,
-            dropout_rate=0.2
-        ),
-        steps_per_epoch=steps_per_epoch
-    )
+            dropout_rate=0.2,
+            timed=timed
+        )
+
     print(model.summary())
     if load_checkpoint_model:
         return model
@@ -2481,15 +4475,25 @@ def train_global_model(
         f"{model_dir}/{model_file_prefix}_ckpt_batch{{batch:06d}}.keras"
     )
     save_every_n = SaveEveryN(save_every, batch_ckpt_tmpl)
-    model.fit(
-        train_generator,
-        epochs=epochs,
-        initial_epoch=start_epoch,
-        steps_per_epoch=steps_per_epoch,
-        #validation_data=val_generator,
-        callbacks=[early_stopping, csv_logger, model_checkpoint, save_every_n],
-        class_weight=class_weight
-    )
+    if model_arc_type == "nrms":
+        model.fit(dg,
+            epochs=epochs,
+            initial_epoch=start_epoch,
+            steps_per_epoch=steps_per_epoch,
+            #validation_data=val_generator,
+            callbacks=[early_stopping, csv_logger, model_checkpoint, save_every_n],
+            class_weight=class_weight
+        )
+    else:
+        model.fit(
+            train_generator,
+            epochs=epochs,
+            initial_epoch=start_epoch,
+            steps_per_epoch=steps_per_epoch,
+            #validation_data=val_generator,
+            callbacks=[early_stopping, csv_logger, model_checkpoint, save_every_n],
+            class_weight=class_weight
+        )
 
     model.save_weights(weights_file)
     print(f"Saved weights to {weights_file}")
@@ -2501,102 +4505,6 @@ def train_global_model(
     return model
 
 import pandas as pd, numpy as np, os, time, json, pathlib
-def evaluate_with_generator(model,
-                            eval_df,
-                            batch_size      = 128,
-                            max_history_len = 50,
-                            max_title_len   = 30,
-                            store_path      = None,
-                            flush_every     = 0.10,
-                            verbose         = 1,
-                            store_metrics_path="metrics.json"):
-
-    gen = DataGenerator(eval_df, batch_size,
-        max_history_length=max_history_len,
-        max_title_length=max_title_len)
-
-    total_batches   = len(gen)
-    flush_interval  = max(1, int(total_batches * flush_every))
-    buf             = []
-    written, seen   = 0, 0
-
-    y_true_all, y_pred_all = [], []
-
-    iterator = tqdm(range(total_batches), desc="Eval", disable=(verbose==0))
-
-    for b in iterator:
-        X, y_true = gen[b]
-        if X is None:
-            continue
-
-        y_pred = model.predict(X, batch_size=batch_size, verbose=0).squeeze()
-
-        y_true_all.append(y_true)
-        y_pred_all.append(y_pred)
-
-        if store_path is not None:
-            for lbl, pred in zip(y_true, y_pred):
-                buf.append({'row_id': seen,
-                            'y_true': float(lbl),
-                            'y_pred': float(pred)})
-                seen += 1
-
-            if len(buf) >= flush_interval * batch_size:
-                _flush(buf, store_path)
-                written += len(buf);  buf.clear()
-
-        if (b + 1) % flush_interval == 0:
-            y_true_so_far = np.concatenate(y_true_all, dtype="float32")
-            y_pred_so_far = np.concatenate(y_pred_all, dtype="float32")
-
-            auc_so_far = roc_auc_score(y_true_so_far, y_pred_so_far)
-            p, r, f, _ = precision_recall_fscore_support(
-                            y_true_so_far,
-                            (y_pred_so_far >= 0.5).astype(int),
-                            average="binary",
-                            zero_division=0)
-
-            if verbose:
-                print(
-                    f"[{b+1:>4}/{total_batches}] "
-                    f"AUC={auc_so_far:0.4f}  P={p:0.4f}  R={r:0.4f}  F1={f:0.4f}"
-                )
-
-    if buf and store_path is not None:
-        _flush(buf, store_path)
-        written += len(buf)
-
-    if verbose and store_path is not None:
-        print(f"Stored {written:,} prediction rows to {store_path}")
-
-    y_true_all = np.concatenate(y_true_all, dtype="float32")
-    y_pred_all = np.concatenate(y_pred_all, dtype="float32")
-
-    metrics = {"samples": int(len(y_true_all)),
-               "AUC": float(roc_auc_score(y_true_all, y_pred_all))}
-    p, r, f, _ = precision_recall_fscore_support(
-                    y_true_all, (y_pred_all >= 0.5).astype(int),
-                    average="binary", zero_division=0)
-    metrics.update({'precision': float(p),
-                    'recall':    float(r),
-                    'F1':        float(f)})
-
-    if verbose:
-        print(json.dumps(metrics, indent=2))
-    with open(store_metrics_path, "w") as file:
-        json.dump(metrics, file, indent=4)
-
-    if store_path is not None:
-        metrics_k = evaluate_parquet_scores(store_path, k_values=[5,10,20,50,100])
-        metrics = {**metrics, **metrics_k}
-
-    if verbose:
-        print("Evaluation summary")
-        print(json.dumps(metrics, indent=2))
-    with open(store_metrics_path, "w") as file:
-        json.dump(metrics, file, indent=4)
-
-    return metrics
 
 def _flush(buffer, path):
     path = pathlib.Path(path)
@@ -2607,13 +4515,314 @@ def _flush(buffer, path):
                                     append=os.path.exists(path))
 
 
-def load(load_this, custom_objects=None, max_history_length=50, max_title_length=30):
+import time
+import tracemalloc
+import psutil
+import torch
+import pandas as pd
+
+def regenerate_metrics_from_parquet(parquet_path: str,
+                                    decision_threshold : float = 0.5,
+                                    tune_threshold     : bool  = False,
+                                    k_values           : tuple = (5,10,20,50,100),
+                                    slate_key          : str   = "ImpressionID",
+                                    store_metrics_dir  : str   = "base_preds",
+                                    store_metrics_file : str   = "metrics.json"):
+    """
+    Re-compute the JSON metrics file for an *existing* prediction parquet.
+      • `parquet_path` must contain y_true and y_pred columns (and row_id).
+      • `tune_threshold=True` will search the threshold that maximises F1,
+        exactly as `evaluate_with_generator` does.
+    The regenerated metrics are saved to
+        {store_metrics_dir}_{threshold:.4f}_<store_metrics_file>
+    and also returned as a dict.
+    """
+    t0 = time.perf_counter()
+    df = pd.read_parquet(parquet_path)
+    if "y_true" not in df.columns or "y_pred" not in df.columns:
+        raise ValueError("Parquet must contain 'y_true' and 'y_pred' columns")
+
+    y_true = df["y_true"].to_numpy(dtype="int8")
+    y_pred = df["y_pred"].to_numpy(dtype="float32")
+
+    if tune_threshold:
+        p, r, thr = precision_recall_curve(y_true, y_pred)
+        f1 = 2 * p * r / (p + r + 1e-12)
+        decision_threshold = thr[np.nanargmax(f1)]
+        print(f"F1-optimal threshold = {decision_threshold:0.4f}")
+
+    bin_pred = (y_pred >= decision_threshold).astype(int)
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, bin_pred, average="binary", zero_division=0)
+
+    # basic classification metrics
+    metrics = dict(
+        samples   = int(len(y_true)),
+        AUC       = float(roc_auc_score(y_true, y_pred)),
+        AP        = float(average_precision_score(y_true, y_pred)),
+        precision = float(p), recall=float(r), F1=float(f1),
+        threshold = float(decision_threshold),
+        runtime_s = time.perf_counter() - t0
+    )
+
+    # add ranking metrics (uses your helper)
+    rank = evaluate_parquet_scores(parquet_path, k_values=[5,10,20,50,100])
+    metrics.update(rank)
+
+    # write metrics file
+    thr_tag = f"{decision_threshold:0.4f}"
+    out_path = Path(f"{store_metrics_dir}/{thr_tag}_{store_metrics_file}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as fh:
+        json.dump(metrics, fh, indent=4)
+    print(f"metrics written to {out_path}")
+
+    return metrics
+
+def evaluate_with_generator(model,
+                            eval_df,
+                            batch_size      = 256,
+                            max_history_len = 50,
+                            max_title_len   = 30,
+                            store_path      = None,
+                            flush_every     = 0.10,
+                            verbose         = 1,
+                            store_metrics_dir="base_preds",
+                            store_metrics_file="metrics.json",
+                            slate_key = "ImpressionID",
+                            threshold = 0.5,
+                            tune_threshold = False,
+                            model_key = "model",
+                            timed=False):
+    decision_threshold = threshold
+    log_print(f"evaluating model {model} on DataFrame with {len(eval_df)} rows and columns {list(eval_df.columns)}")
+    log_print(f"store_path:{store_path} and store_metrics_dir: {store_metrics_dir}")
+    start_time = time.perf_counter() # mark start time
+    tracemalloc.start() # begin Python memory tracing
+    process = psutil.Process()
+    proc = process
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats() # zero out GPU memory peaks
+    # Containers for batch‐level stats
+    batch_latencies = []
+
+
+    gen = DataGenerator(eval_df, batch_size,
+        max_history_length=max_history_len,
+        max_title_length=max_title_len)
+
+    total_batches   = len(gen)
+    flush_interval  = max(1, int(total_batches * flush_every))
+    buf             = []
+    written, seen   = 0, 0
+    y_true_all, y_pred_all = [], []
+
+    iterator = tqdm(range(total_batches), desc="Eval", disable=(verbose==0))
+
+    for b in iterator:
+        t0 = time.perf_counter()
+
+        start = b * batch_size
+        end   = min((b + 1) * batch_size, len(eval_df))
+        batch_df  = eval_df.iloc[start:end]
+
+        X, y_true = gen[b]
+        if X is None:
+            continue
+
+
+
+        #logdir = f"./logs/eval/{model_key}"
+        #out_dir = Path(logdir)
+        #out_dir.mkdir(exist_ok=True)
+
+        from tensorflow.keras.callbacks import TensorBoard
+        from tensorflow.python.profiler import profiler_v2 as profiler
+
+        logdir = "./logs/profile_cpu_only"
+        """
+        tf.profiler.experimental.start(
+            logdir,
+            options=tf.profiler.experimental.ProfilerOptions(
+                # profile Python & TF ops on the host:
+                host_tracer_level=2,
+                python_tracer_level=1,
+                # disable GPU/CUPTI tracing:
+                device_tracer_level=0
+            )
+        )
+        """
+        # create the TensorBoard callback with profiling enabled for batches 2–4
+        #tb_cb = tf.keras.callbacks.TensorBoard(
+        #    log_dir=logdir,
+        #    profile_batch=(2, 4)
+        #)
+        #tf.profiler.experimental.start('logs/trace')
+        """
+        import tensorflow as tf
+        tf.config.run_functions_eagerly(True)
+
+        for layer in model.layers:
+            orig_call = layer.call
+            def make_timed(orig_call):
+                @functools.wraps(orig_call)
+                def timed(self, inputs, *args, **kwargs):
+                    t0 = time.perf_counter()
+                    out = orig_call(inputs, *args, **kwargs)
+                    dt = (time.perf_counter() - t0) * 1000
+                    print(f"{self.name:20s} → {dt:6.1f} ms")
+                    return out
+                return timed
+
+            layer.call = make_timed(orig_call).__get__(layer, layer.__class__)
+        """
+        #inp, _ = next(iter(X))   # get one batch of inputs,labels
+        #_ = model.predict_on_batch(inp)
+        #return s
+        y_pred = model.predict(X,
+                               batch_size=batch_size,
+                               verbose=1,
+                               #callbacks=[tb_cb]
+                            ).squeeze()
+        #tf.profiler.experimental.stop()
+        #tf.profiler.experimental.stop()
+        t1 = time.perf_counter()
+        batch_latencies.append(t1 - t0)
+
+
+        y_true_all.append(y_true)
+        y_pred_all.append(y_pred)
+        if store_path is not None:
+            #for lbl, pred, impr in zip(y_true, y_pred, batch_df["ImpressionID"]):
+            #    buf.append({'row_id': seen, "ImpressionID": int(impr),
+            for lbl, pred, impr in zip(y_true, y_pred, eval_df[slate_key].iloc[start:end]):
+                buf.append({'row_id': seen,
+                            slate_key: impr,
+                            'y_true': float(lbl),
+                            'y_pred': float(pred)})
+                seen += 1
+            if len(buf) >= flush_interval * batch_size:
+                _flush(buf, store_path)
+                written += len(buf); buf.clear()
+
+        if (b + 1) % flush_interval == 0 and verbose:
+            y_true_so_far = np.concatenate(y_true_all, dtype="float32")
+            y_pred_so_far = np.concatenate(y_pred_all, dtype="float32")
+            auc_so_far = roc_auc_score(y_true_so_far, y_pred_so_far)
+            p, r, f, _ = precision_recall_fscore_support(
+                            y_true_so_far,
+                            (y_pred_so_far >= 0.5).astype(int),
+                            average="binary",
+                            zero_division=0)
+            print(f"[{b+1}/{total_batches}] AUC={auc_so_far:.4f} P={p:.4f} R={r:.4f} F1={f:.4f}")
+
+    # flush leftovers
+    if buf and store_path is not None:
+        _flush(buf, store_path)
+        written += len(buf)
+    if verbose and store_path is not None:
+        print(f"Stored {written:,} rows to {store_path}")
+
+
+    total_time = time.perf_counter() - start_time
+
+    peak_gpu_mem = None
+    if torch.cuda.is_available():
+        peak_gpu_mem = torch.cuda.max_memory_allocated()  # peak during run
+
+    current_mem, peak_mem = tracemalloc.get_traced_memory()  # current & peak
+    tracemalloc.stop()
+
+    rss = process.memory_info().rss  # Resident Set Size
+
+
+    y_true_all = np.concatenate(y_true_all, dtype="float32")
+    y_pred_all = np.concatenate(y_pred_all, dtype="float32")
+
+    if tune_threshold:
+        p, r, thr = precision_recall_curve(y_true_all, y_pred_all)
+        f1 = 2 * p * r / (p + r + 1e-12)
+        decision_threshold = thr[np.nanargmax(f1)]
+        log_print(f"F1-optimal threshold = {decision_threshold:0.4f}")
+
+    binary_pred = (y_pred_all >= decision_threshold).astype(int)
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true_all, binary_pred, average="binary", zero_division=0)
+
+    auc = roc_auc_score(y_true_all, y_pred_all)
+    elapsed = total_time
+    cur_mem = current_mem
+    tracemalloc.stop()
+
+    metrics = dict(samples = int(len(y_true_all)),
+                AUC       = float(auc),
+                precision = float(p), recall = float(r), F1 = float(f1),
+                threshold = float(decision_threshold),
+                runtime_s = elapsed,
+                python_mem_current_bytes = cur_mem,
+                python_mem_peak_bytes    = peak_mem,
+                process_rss_bytes        = proc.memory_info().rss,
+                gpu_peak_bytes           = torch.cuda.max_memory_allocated()
+                                            if torch.cuda.is_available() else 0)
+
+    if store_path is not None:
+        metrics_k = evaluate_parquet_scores(store_path,
+                                            k_values=[5,10,20,50,100])
+        metrics.update(metrics_k)
+    if timed:
+        with open('logs/timings.log') as f:
+            log_lines = [l.strip() for l in f if l.strip()]
+
+        # parse lines like "{'make_mask': '0.8ms', 'mha': '16.4ms', ...}"
+        times = defaultdict(list)
+        pattern = re.compile(r"'(\w+)':\s*'([\d\.]+)ms'")
+        for line in log_lines:
+            for key, val in pattern.findall(line):
+                times[key].append(float(val))
+
+        # compute per-component averages
+        avg_times = {comp: sum(vs) / len(vs) for comp, vs in times.items()}
+
+        # 3) merge into your main metrics dict
+        #    e.g. metrics['avg_make_mask_ms'] = 0.8, metrics['avg_mha_ms'] = 16.4, ...
+        for comp, avg in avg_times.items():
+            metrics[f'avg_{comp}_ms'] = avg
+
+        # 4) (optional) also print a nice DataFrame
+        df = (
+            pd.DataFrame([
+                {'component': comp, 'avg_time_ms': avg}
+                for comp, avg in avg_times.items()
+            ])
+            .sort_values('avg_time_ms', ascending=False)
+            .reset_index(drop=True)
+        )
+        print("\nPer-layer average timings:")
+        print(df.to_string(index=False))
+    thr_metrics_file = f"{decision_threshold:0.4f}_{store_metrics_file}"
+    store_metrics_path = Path(f"{store_metrics_dir}/{thr_metrics_file}")
+    print(f"write metrics to: {store_metrics_path}")
+    # save metrics file
+    with open(store_metrics_path, "w") as fp:
+        json.dump(metrics, fp, indent=4)
+
+    if verbose:
+        print("Final metrics:", json.dumps(metrics, indent=2))
+
+    return metrics
+
+def load(load_this, custom_objects=None, max_history_length=50, max_title_length=30, timed=False):
+    if timed:
+        tf.config.run_functions_eagerly(True)
+        tf.config.experimental.set_synchronous_execution(True)
     logging.info(f"Loading model: {load_this}")
+    logging.info(f"custom_objects: {custom_objects}")
     print(f"Loading model: {load_this}")
-    custom_objects = {
-        'UserEncoder': UserEncoder,
-        'NewsEncoder': NewsEncoder,
-    }
+    if custom_objects == None:
+        custom_objects = {
+            'UserEncoder': UserEncoder,
+            'NewsEncoder': NewsEncoder,
+        }
     import keras
     print(tf.__version__)
     print(tf.keras.__version__)
@@ -2642,7 +4851,7 @@ def train_category_models(category_train_dfs, vocab_size, max_history_length, ma
     category_models = {}
     for category, df in category_train_dfs.items():
         if model_base == '':
-            model_file_prefix=f"fastformer_{model_size}_category_{category}_{epochs}epochs"
+            model_file_prefix=f"fastformer_{dataset_size}_category_{category}_{epochs}epochs"
         else:
             model_file_prefix = f'fastformer_category_{category}_{model_base}'
         print(f"Training {category.upper()}")
@@ -2705,24 +4914,37 @@ def train_category_models(category_train_dfs, vocab_size, max_history_length, ma
 
 def is_colab():
     return 'COLAB_GPU' in os.environ
+def negative_train_test_split(train_df, y=None, test_size=0.2, random_state=42, stratify=None):
+    if test_size > 0.0:
+        if y is None:
+            train_data, val_data = train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
+        else:
+            train_data, val_data, y_train, y_val = train_test_split(train_df, y, test_size=test_size, random_state=random_state, stratify=None)
+    else:
+        train_data=train_df
+        val_data = pd.DataFrame([{}])
+    if y is None:
+        return train_data, val_data
+    else:
+        return train_data, val_data, y_train, y_val
 def make_clustered_data(train_df, num_clusters, test_size=0.2, random_state=42, split_indepently=False):
     clustered_data = {}
-    
-    total_train_data, total_val_data = train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
+
+    total_train_data, total_val_data = negative_train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
     for cluster in range(num_clusters):
         if split_indepently:
             cluster_data = train_df[train_df['Cluster'] == cluster]
             if cluster_data.empty:
                 print(f"No data for Cluster {cluster}.")
                 continue
-            train_data, val_data = train_test_split(cluster_data, test_size=test_size, random_state=random_state, stratify=None)
+            train_data, val_data = negative_train_test_split(cluster_data, test_size=test_size, random_state=random_state, stratify=None)
             clustered_data[cluster] = {
                 'train': train_data.reset_index(drop=True),
                 'val': val_data.reset_index(drop=True)
             }
         else:
             train_data = total_train_data[total_train_data['Cluster'] == cluster]
-            val_data = total_val_data[total_val_data['Cluster'] == cluster]
+            val_data = total_val_data[total_val_data['Cluster'] == cluster] if not total_val_data.empty else pd.DataFrame([{}])
             if train_data.empty:
                 print(f"No data for Cluster {cluster}.")
                 continue
@@ -2741,14 +4963,14 @@ def make_category_data(train_df, test_size=0.2, random_state=42, split_indepentl
             print(f"cat:{cat}, cat_df:{cat_df}")
             if cat_df.empty:
                 continue
-            tr, val = train_test_split(cat_df, test_size=test_size, random_state=random_state, stratify=None)
+            tr, val = negative_train_test_split(cat_df, test_size=test_size, random_state=random_state, stratify=None)
             category_data[cat] = {
                 "train": tr.reset_index(drop=True),
                 "val":   val.reset_index(drop=True)
             }
-            print(f"[{cat}] {len(tr):,} train / {len(val):,} val samples")
+            print(f"[{cat}] {len(tr)} train / {len(val)} val samples")
     else:
-        tr, val = train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
+        tr, val = negative_train_test_split(train_df, test_size=test_size, random_state=random_state, stratify=None)
         for cat, cat_df in tr.groupby("CandidateCategory"):
             print(f"cat:{cat}, cat_df:{cat_df}")
             if cat_df.empty:
@@ -2756,11 +4978,15 @@ def make_category_data(train_df, test_size=0.2, random_state=42, split_indepentl
             category_data[cat] = {
                 "train": tr.reset_index(drop=True)
             }
-        for cat, cat_df in val.groupby("CandidateCategory"):
-            print(f"cat:{cat}, cat_df:{cat_df}")
-            if cat_df.empty:
-                continue
+        if val.empty:
+            log_print("No validation data !!!!!!!!!!!!")
             category_data[cat]["val"] = val.reset_index(drop=True)
+        else:
+            for cat, cat_df in val.groupby("CandidateCategory"):
+                print(f"cat:{cat}, cat_df:{cat_df}")
+                if cat_df.empty:
+                    continue
+                category_data[cat]["val"] = val.reset_index(drop=True)
     return category_data
 
 def make_user_cluster_df(user_category_profiles_path = 'user_category_profiles.pkl', user_cluster_df_path = 'user_cluster_df.pkl'):
@@ -2868,8 +5094,9 @@ def unzip_datasets(data_dir, valid_data_dir, zip_file, valid_zip_file):
     news_file = 'news.tsv'
     behaviors_file = 'behaviors.tsv'
 
-def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/train/', valid_data_dir = 'dataset/valid/', zip_file = f"MINDlarge_train.zip", valid_zip_file = f"MINDlarge_dev.zip", download=False,
-    news_df_pkl="models/news_df_processed.pkl", train_df_pkl="models/train_df_processed.pkl", categorized_samples=False):
+def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/train/', train_data_dir = 'dataset/train/', valid_data_dir = 'dataset/valid/', zip_file = f"MINDlarge_train.zip", valid_zip_file = f"MINDlarge_dev.zip", download=False,
+    news_df_pkl="models/news_df_processed.pkl", train_df_pkl="models/train_df_processed.pkl", categorized_samples=False, test_size=0.2, dataset="train", process_valid_sets=False, dataset_size="small",
+    behavior_pickles=[[]], eval_frac=1.0, big_tokenizer=False, pivots=[45], ks=[5]):
     print(f"train_df_pkl={train_df_pkl},news_df_pkl={news_df_pkl}")
     global vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters
     if is_colab():
@@ -2882,6 +5109,9 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
     news_file = 'news.tsv'
     behaviors_file = 'behaviors.tsv'
     
+    if dataset == "valid":
+        data_dir = valid_data_dir
+
     # Load news data
     news_path = os.path.join(data_dir, news_file)
     news_df = pd.read_csv(
@@ -2896,15 +5126,26 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
     
     # Load behaviors data
     behaviors_path = os.path.join(data_dir, behaviors_file)
+        
+    modified_behaviors_df_full = None
+    modified_behaviors_df_k10 = None
+    modified_behaviors_df_swap = None
+    #if dataset == "valid":
+    #    modified_behaviors_df_full = pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_full.pkl")
+    #    modified_behaviors_df_k10 = pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_k10.pkl")
+    #    modified_behaviors_df_swap = pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_swap.pkl")
+    
     behaviors_df = pd.read_csv(
         behaviors_path,
         sep='\t',
         names=['ImpressionID', 'UserID', 'Time', 'HistoryText', 'Impressions'],
         index_col=False
     )
-    
     print("\nLoaded behaviors data:")
     print(behaviors_df.head())
+
+    #print("\nLoaded modified_behaviors_df_full data:")
+    #print(modified_behaviors_df_full.head())
 
     valid_news_path = os.path.join(valid_data_dir, news_file)
     valid_news_df = pd.read_csv(
@@ -3042,12 +5283,8 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
         print(f"\nShape of filtered_user_category_profiles: {filtered_user_category_profiles.shape}")
         
         # Save the user_category_profiles to a file for future use
-        if "small" in data_dir:
-            user_category_profiles_path = 'small_user_category_profiles.pkl'
-            behaviors_df_processed_path = "small_behaviors_df_processed.pkl"
-        else:
-            user_category_profiles_path = 'user_category_profiles.pkl'
-            behaviors_df_processed_path = "behaviors_df_processed.pkl"
+        user_category_profiles_path = f"{dataset}_{dataset_size}_user_category_profiles.pkl"
+        behaviors_df_processed_path = f"{dataset}_{dataset_size}_behaviors_df_processed.pkl"
         
         filtered_user_category_profiles.to_pickle(user_category_profiles_path)
         user_category_profiles = filtered_user_category_profiles
@@ -3055,6 +5292,7 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
         behaviors_df.to_pickle(behaviors_df_processed_path)
         print(f"\nSaved behaviors_df to {behaviors_df_processed_path}")
     else:
+        """
         local_model_path = hf_hub_download(
             repo_id=f"Teemu5/news",
             filename="user_category_profiles.pkl",
@@ -3065,8 +5303,12 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
             filename="behaviors_df_processed.pkl",
             local_dir="models"
         )
-        user_category_profiles = pd.read_pickle("models/user_category_profiles.pkl")
-        behaviors_df = pd.read_pickle("models/behaviors_df_processed.pkl")
+        """
+        user_category_profiles_path = f"{dataset}_{dataset_size}_user_category_profiles.pkl"
+        behaviors_df_processed_path = f"{dataset}_{dataset_size}_behaviors_df_processed.pkl"
+        user_category_profiles = pd.read_pickle(user_category_profiles_path)
+        behaviors_df = pd.read_pickle(behaviors_df_processed_path)
+
     print(f"Number of columns in user_category_profiles: {len(user_category_profiles.columns)}")
     # Number of unique users in behaviors_df
     unique_user_ids = behaviors_df['UserID'].unique()
@@ -3085,8 +5327,30 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
     tokenizer = Tokenizer()
     num_clusters = 3
     if process_dfs:
+        # processing eval sets next
+        # train_df_pkl_full=None, news_df_pkl_full=None, train_df_pkl_k10=None, news_df_pkl_k10=None, train_df_pkl_swap=None, news_df_pkl_swap=None,
+        """
+        for behavior_pickle_l in behavior_pickles:
+            behavior_pickle, train_df_pkl_full, news_df_pkl_full = behavior_pickle_l
+            clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters = prepare_train_df(
+                data_dir=data_dir,
+                news_file=news_file,
+                behaviors_file=behaviors_file,
+                user_category_profiles=user_category_profiles,
+                num_clusters=num_clusters,
+                fraction=1,
+                max_title_length=30,
+                max_history_length=50,
+                train_df_pkl=train_df_pkl_full, news_df_pkl=news_df_pkl_full, categorized_samples=categorized_samples,
+                test_size=test_size,
+                dataset=dataset, process_valid_sets=process_valid_sets, dataset_size=dataset_size, behavior_pickle=behavior_pickle
+            )
+        """
+        ###
         clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters = prepare_train_df(
             data_dir=data_dir,
+            train_data_dir=train_data_dir,
+            valid_data_dir=valid_data_dir,
             news_file=news_file,
             behaviors_file=behaviors_file,
             user_category_profiles=user_category_profiles,
@@ -3094,8 +5358,13 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
             fraction=1,
             max_title_length=30,
             max_history_length=50,
-            train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples
+            train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples,
+            test_size=test_size,
+            dataset=dataset, process_valid_sets=process_valid_sets, dataset_size=dataset_size,
+            eval_frac=eval_frac, big_tokenizer=big_tokenizer, pivots=pivots, ks=ks
         )
+
+    ###
     if download:
         local_model_path = hf_hub_download(
             repo_id=f"Teemu5/news",
@@ -3110,9 +5379,9 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
     news_df = pd.read_pickle(news_df_pkl)
     train_df = pd.read_pickle(train_df_pkl)
 
-    clustered_data = make_clustered_data(train_df, num_clusters)
+    clustered_data = make_clustered_data(train_df, num_clusters,test_size=test_size)
     if categorized_samples:
-        category_data = make_category_data(train_df)
+        category_data = make_category_data(train_df,test_size=test_size)
     else:
         category_data = {}
 
@@ -3121,8 +5390,7 @@ def init(process_dfs = False, process_behaviors = False, data_dir = 'dataset/tra
     max_history_length = 50
     max_title_length = 30
     batch_size = 64
-    return data_dir, vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters, category_data
-
+    return data_dir, vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters, category_data, modified_behaviors_df_full, modified_behaviors_df_k10, modified_behaviors_df_swap
 def quick_compare(bdf, tdf, n=5):
     both = pd.concat([bdf.head(n).assign(src="behaviors"),
                       tdf.head(n).assign(src="train")])
@@ -3165,11 +5433,73 @@ def log_print(s):
     logging.info(s)
     print(s)
 
+def print_to_file(text: str, filename: str, mode: str = 'a', encoding: str = 'utf-8'):
+    with open(filename, mode, encoding=encoding) as f:
+        print(text, file=f)
+
+def add_candidate_tokens(df, news_text_dict, max_title_len=30):
+    df = df.copy()
+    log_print(f"creawting CandidateTitleTokens column")
+    df["CandidateTitleTokens"] = df["CandidateID"].map(
+        lambda nid: news_text_dict.get(nid, [0]*max_title_len)
+    )
+    log_print(f"added column df['CandidateTitleTokens']: {df['CandidateTitleTokens']}")
+    return df
+
+def _load_eval(path):
+    log_print(f"loading {path}")
+    df = pd.read_pickle(path)
+    #df = pd.read_parquet(path, engine="pyarrow", dtype_backend="pyarrow")
+    #for col in ("HistoryTitles", "CandidateTitleTokens"):
+    #    df[col] = df[col].tolist()
+    """
+    df = pd.read_parquet(
+        path,
+        engine="pyarrow",
+        dtype_backend="numpy_nullable",
+    )
+    
+    df = pd.read_parquet(
+            path,
+            engine="pyarrow",
+            dtype_backend="pyarrow"
+    )
+    .astype({
+        "HistoryTitles":        "object",
+        "CandidateTitleTokens": "object",
+    })
+    log_print(f"finished loading {path}")
+    df["HistoryTitles"] = df["HistoryTitles"].apply(
+        lambda seqs: [[int(tok) for tok in title] for title in seqs]
+    )
+    df["CandidateTitleTokens"] = df["CandidateTitleTokens"].apply(
+        lambda toks: [int(tok) for tok in toks]
+    )
+    log_print(f"finished loading {path}")
+    for col in ("HistoryTitles", "CandidateTitleTokens"):
+        df[col] = df[col].array.to_numpy(zero_copy_only=True)
+    df = df.astype({
+            "HistoryTitles":        "object",
+            "CandidateTitleTokens": "object",
+    })
+    
+    log_print(f"finished loading {path}")
+    for col in ("HistoryTitles", "CandidateTitleTokens"):
+        df[col] = (df[col]
+            .to_pylist()
+            .apply(lambda x: np.asarray(x, dtype="int32")))
+    log_print(f"finished convert")
+    """
+    return df
+
 def get_models(process_dfs = False, process_behaviors = False, data_dir = 'dataset/train/', valid_data_dir = 'dataset/valid/', zip_file = f"MINDlarge_train.zip", valid_zip_file = f"MINDlarge_dev.zip",
     model_type='cluster', dataset_size='large', model_size='large', load_best_model=False, load_best_models=[], epochs=1, retrain_models = [], evaluate=False, skip_already_evaluated=False, dataset_fraction=1.0,
-    dataset='train', batch_size=256, eval_dataset_size='large', cutoff_time_str=None, eval_full=False, test_size=0.0, use_model_base=False):
+    dataset='train', batch_size=256, eval_dataset_size='large', cutoff_time_str=None, eval_full=False, test_size=0.0, use_model_base=False, process_valid_sets=False, end_after_preprocess=False, make_title_tensor=False,
+    eval_frac=1.0, big_tokenizer=False, small_train_data_dir = "dataset/small/train/", pivots=[45], ks=[5], reverse=False, tune_threshold=False, regenerate_metrics=False, vers_suffix="_v4", model_arc_type="fastformer",
+    timed=False, use_cpu=False, clear_store=False):
     news_file = 'news.tsv'
     behaviors_file = 'behaviors.tsv'
+
     small_news_df_pkl = "models/small_news_df_processed"
     small_train_df_pkl = "models/small_train_df_processed"
     news_df_pkl = "models/news_df_processed"
@@ -3181,24 +5511,57 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
         news_df_pkl = f"{news_df_pkl}_categorized"
         train_df_pkl = f"{train_df_pkl}_categorized"
         categorized_samples = True
+    if dataset != 'train':
+        small_news_df_pkl = f"{small_news_df_pkl}_{dataset}"
+        small_train_df_pkl = f"{small_train_df_pkl}_{dataset}"
+        news_df_pkl = f"{news_df_pkl}_{dataset}"
+        train_df_pkl = f"{train_df_pkl}_{dataset}"
+
+    small_news_df_pkl_full = f"{small_news_df_pkl}_full.pkl"
+    small_train_df_pkl_full = f"{small_train_df_pkl}_full.pkl"
+    news_df_pkl_full = f"{news_df_pkl}_full.pkl"
+    train_df_pkl_full = f"{train_df_pkl}_full.pkl"
+    small_news_df_pkl_k10 = f"{small_news_df_pkl}_k10.pkl"
+    small_train_df_pkl_k10 = f"{small_train_df_pkl}_k10.pkl"
+    news_df_pkl_k10 = f"{news_df_pkl}_k10.pkl"
+    train_df_pkl_k10 = f"{train_df_pkl}_k10.pkl"
+    small_news_df_pkl_swap = f"{small_news_df_pkl}_swap.pkl"
+    small_train_df_pkl_swap = f"{small_train_df_pkl}_swap.pkl"
+    news_df_pkl_swap = f"{news_df_pkl}_swap.pkl"
+    train_df_pkl_swap = f"{train_df_pkl}_swap.pkl"
+
+
     small_news_df_pkl = f"{small_news_df_pkl}.pkl"
     small_train_df_pkl = f"{small_train_df_pkl}.pkl"
     if "small" in data_dir:
         news_df_pkl = small_news_df_pkl
         train_df_pkl = small_train_df_pkl
+        news_df_pkl_full = small_news_df_pkl_full
+        train_df_pkl_full = small_train_df_pkl_full
+        news_df_pkl_k10 = small_news_df_pkl_k10
+        train_df_pkl_k10 = small_train_df_pkl_k10
+        news_df_pkl_swap = small_news_df_pkl_swap
+        train_df_pkl_swap = small_train_df_pkl_swap
     else:
         news_df_pkl = f"{news_df_pkl}.pkl"
         train_df_pkl = f"{train_df_pkl}.pkl"
-    if not os.path.exists(train_df_pkl):
-        log_print(f"\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!")
-        news_df_pkl = small_news_df_pkl
-        train_df_pkl = small_train_df_pkl
+        news_df_pkl_full = news_df_pkl_full
+        train_df_pkl_full = train_df_pkl_full
+        news_df_pkl_k10 = news_df_pkl_k10
+        train_df_pkl_k10 = train_df_pkl_k10
+        news_df_pkl_swap = news_df_pkl_swap
+        train_df_pkl_swap = train_df_pkl_swap
 
-    data_dir, vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters, category_data = init(process_dfs, process_behaviors, data_dir, valid_data_dir, zip_file, valid_zip_file,
-    train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples)
+    data_dir, vocab_size, max_history_length, max_title_length, news_df, train_df, behaviors_df, user_category_profiles, clustered_data, tokenizer, num_clusters, category_data, modified_behaviors_df_full, modified_behaviors_df_k10, modified_behaviors_df_swap = init(process_dfs, process_behaviors, data_dir, small_train_data_dir, valid_data_dir, zip_file, valid_zip_file,
+    train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples, test_size=test_size, dataset=dataset, process_valid_sets=process_valid_sets,dataset_size=dataset_size,
+    behavior_pickles=[[f"evaluation_{dataset}_{dataset_size}_full.parquet",train_df_pkl_full,news_df_pkl_full],
+    [f"evaluation_{dataset}_{dataset_size}_k10.parquet",train_df_pkl_k10,news_df_pkl_k10],
+    [f"evaluation_{dataset}_{dataset_size}_swap.parquet",train_df_pkl_swap,news_df_pkl_swap]], eval_frac=eval_frac, big_tokenizer=big_tokenizer, pivots=pivots, ks=ks)
+    """
     if process_dfs:
         clustered_data, tokenizer, vocab_size, max_history_length, max_title_length, num_clusters = prepare_train_df(
             data_dir=data_dir,
+            valid_data_dir=valid_data_dir,
             news_file=news_file,
             behaviors_file=behaviors_file,
             user_category_profiles=user_category_profiles,
@@ -3206,20 +5569,36 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
             fraction=1,
             max_title_length=30,
             max_history_length=50,
-            train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples
+            train_df_pkl=train_df_pkl, news_df_pkl=news_df_pkl, categorized_samples=categorized_samples,
+            test_size=test_size,
+            dataset=dataset,process_valid_sets=process_valid_sets,dataset_size=dataset_size,
+            eval_frac=eval_frac
         )
+    """
+    if not os.path.exists(train_df_pkl) or not os.path.exists(news_df_pkl):
+        log_print(f"\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} or news_df_pkl: {news_df_pkl} DOESN'T EXIST switching to use small_news_df_pkl:{small_news_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST switching to use small_train_df_pkl:{small_train_df_pkl} !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!\n !!! train_df_pkl: {train_df_pkl} DOESN'T EXIST !!!!")
+        news_df_pkl = small_news_df_pkl
+        train_df_pkl = small_train_df_pkl
     if test_size > 0.0:
-        train_data, test_data = train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
-        category_data = make_category_data(train_df, test_size=test_size, random_state=42)
+        train_data, test_data = negative_train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
+        #category_data = make_category_data(train_df, test_size=test_size, random_state=42)
     else:
         train_data = train_df
-        test_data = None
+        test_data = train_df
     quick_compare(behaviors_df, train_df)
     model_base = ''
+    print(f"model_base:{model_base}")
     if use_model_base:
         model_base = f"{model_size}_full_balanced_{epochs}_epoch"
         if test_size > 0.0:
             model_base = f"{model_size}_train_size_{1-test_size}_balanced_{epochs}_epoch"
+        if big_tokenizer:
+            model_base = f"{model_base}_big_tokenizer"
+        if timed:
+            model_base = f"{model_base}_timed"
+
+    print(f"model_base:{model_base}")
+
     if model_type == 'cluster' or model_type == 'all':
         cluster_models = train_cluster_models(
             clustered_data=clustered_data,
@@ -3232,12 +5611,15 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
             epochs=epochs,
             size=model_size,
             retrain='cluster' in retrain_models,
-            model_base=model_base
+            model_base=model_base,
+            dataset_size=dataset_size,
+            dataset=dataset,
+            test_size=test_size
         )
         logging.info(f"loaded total cluster_models:{cluster_models}")
     if model_type == 'global' or model_type == 'all':
         global_model = train_global_model(train_data, tokenizer, vocab_size, max_history_length, max_title_length, val_data=test_data, dataset_size=model_size, batch_size=batch_size, epochs=epochs,
-        retrain='global' in retrain_models, load_best_model='global' in load_best_models, model_base=model_base)
+        retrain='global' in retrain_models, load_best_model='global' in load_best_models, model_base=model_base, model_arc_type=model_arc_type, timed=timed)
         global_models = {}
         global_models[f"global_{model_size}"] = global_model
         logging.info(f"loaded total global_models:{global_models}")
@@ -3254,21 +5636,63 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
         models = global_models
     elif model_type == "all":
         models = {**cluster_models, **category_models, **global_models}
+
     logging.info(f"loaded total models:{models}")
     logging.info(f"difference between train_df:{train_df} and behaviors_df:{behaviors_df}")
     if evaluate:
         out_dir = Path("base_preds")
         out_dir.mkdir(exist_ok=True)
-        test_data = train_df
         if not eval_full:
             if test_size > 0.0:
-                train_data, test_data = train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
-            #train_data, test_data = train_test_split_time(train_df, cutoff_time_str)
+                train_data, test_data = negative_train_test_split(train_df, test_size=test_size, random_state=42, stratify=None)
+            #train_data, test_data = negative_train_test_split_time(train_df, cutoff_time_str)
         else:
             test_size=1.0
-        for key, model in models.items():
-            store_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}.parquet"
-            store_metrics_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}_metrics.json"
+            test_data = train_df
+        
+        title_tensor, id_to_index = get_title_tensors(dataset, dataset_size, news_df, tokenizer, make_new=make_title_tensor)
+        subset_tag = "" if eval_frac >= 1.0 else f"_{eval_frac}"
+        col_dfs = []
+        ## SETS DATASET AS VALID LARGE WHEN TRIAN DATASET
+        if dataset == 'train':
+            dataset = 'valid'
+            dataset_size = 'large'
+        col = f"Hist_full{subset_tag}"
+        col_dfs.append([col, _load_eval(f"evaluation_{dataset}_{dataset_size}{subset_tag}_{col}.pkl")])
+        for pivot in pivots:
+            col = f"Hist_swap{pivot}{subset_tag}"
+            col_dfs.append([col, _load_eval(f"evaluation_{dataset}_{dataset_size}{subset_tag}_{col}.pkl")])
+        for k in ks:
+            col = f"Hist_k{k}{subset_tag}"
+            col_dfs.append([col, _load_eval(f"evaluation_{dataset}_{dataset_size}{subset_tag}_{col}.pkl")])
+        items = list(models.items())
+        if reverse:
+            items.reverse()
+            print(f"reversed:{items}")
+        if timed:
+            vers_suffix = f"{vers_suffix}_timed"
+            tf.config.run_functions_eagerly(True)
+            tf.config.experimental.set_synchronous_execution(True)
+        if use_cpu:
+            vers_suffix = f"{vers_suffix}_cpu"
+        for key, model in items:
+            key = f"{model_arc_type}_{key}"
+            base_store_file = f"{key}_{dataset}_{dataset_size}_test_size_{test_size}{vers_suffix}"
+            base_store_path = out_dir / f"{base_store_file}"
+            base_store_metrics_file = f"{key}_{dataset}_{dataset_size}_test_size_{test_size}_metrics{vers_suffix}"
+            base_store_metrics_path = out_dir / f"0.5000_{base_store_metrics_file}"
+            store_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}{vers_suffix}.parquet"
+            store_metrics_path = out_dir / f"{key}_{dataset}_{dataset_size}_test_size_{test_size}_metrics{vers_suffix}.json"
+
+            #print(f"loaded df_full:{df_full.head()}")
+            #df_full.to_pickle(f"evaluation_{dataset}_{dataset_size}_full.pkl")
+            #df_k10.to_pickle(f"evaluation_{dataset}_{dataset_size}_k10.pkl")
+            #df_swap.to_pickle(f"evaluation_{dataset}_{dataset_size}_swap.pkl")
+            #modified_behaviors_df_full = pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_full.pkl")
+            #modified_behaviors_df_k10 = pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_k10.pkl")
+
+
+            """
             if skip_already_evaluated and store_path.exists() and store_path.stat().st_size > 0:
                 log_print(f"Skipping evaluation for {key}: {store_path}")
                 continue
@@ -3278,11 +5702,86 @@ def get_models(process_dfs = False, process_behaviors = False, data_dir = 'datas
                 eval_df=test_data,
                 batch_size=batch_size,
                 store_path=store_path,
-                flush_every=0.10,
+                flush_every=0.01,
                 verbose=1,
                 store_metrics_path=store_metrics_path
             )
             logging.info(f"model {key} eval res:{res}")
+            log_print("SKIPS modified sets EVAL!!!")
+            continue
+            """
+
+
+            for col, df in col_dfs:
+                print(f"eval col: {col}")
+                adapt_store_path = f"{base_store_path}_{col}.parquet"
+                adapt_store_metrics_path = f"{base_store_metrics_path}_{col}.json"
+                adapt_store_metrics_file = f"{base_store_metrics_file}_{col}.json"
+                if regenerate_metrics:
+                    regenerate_metrics_from_parquet(adapt_store_path,
+                                    decision_threshold = 0.5,
+                                    tune_threshold = False,
+                                    store_metrics_dir=out_dir,
+                                    store_metrics_file=adapt_store_metrics_file)
+                    
+                    log_print(f"Regenerated {adapt_store_path}, continuing to next")
+                    continue
+                if skip_already_evaluated and Path(adapt_store_path).exists() and Path(adapt_store_path).stat().st_size > 0:
+                    log_print(f"Skipping evaluation for {key}, col:{col}: {adapt_store_path}")
+                    continue
+                log_print(f"evaluting with evaluation_{dataset}_{dataset_size}{subset_tag}_{col}.pkl")
+                if timed:
+                    try:
+                        os.remove('logs/timings.log')
+                    except FileNotFoundError:
+                        pass
+                if clear_store:
+                    os.remove(adapt_store_path)
+                res = evaluate_with_generator(
+                    model,
+                    eval_df=df,
+                    batch_size=batch_size,
+                    store_path=adapt_store_path,
+                    flush_every=0.01,
+                    verbose=1,
+                    store_metrics_dir=out_dir,
+                    store_metrics_file=adapt_store_metrics_file,
+                    tune_threshold=tune_threshold,
+                    model_key=key,
+                    timed=timed
+                )
+
+            log_print("SKIPS NORMAL EVAL!!! EVALUATES ONLY ON MODIFIED DATASETS!!!!!!!!!!!!")
+            continue
+
+            if skip_already_evaluated and store_path.exists() and store_path.stat().st_size > 0:
+                log_print(f"Skipping evaluation for {key}: {store_path}")
+                continue
+            log_print(f"evaluation with key:{key}, model:{model}, {store_path}:{store_path}, store_metrics_path:{store_metrics_path}")
+            if timed:
+                try:
+                    os.remove('logs/timings.log')
+                except FileNotFoundError:
+                    pass
+            res = evaluate_with_generator(
+                model,
+                eval_df=test_data,
+                batch_size=batch_size,
+                store_path=store_path,
+                flush_every=0.01,
+                verbose=1,
+                store_metrics_path=store_metrics_path
+            )
+            logging.info(f"model {key} eval res:{res}")
+
+            #baseline   = run_eval(pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_full.pkl"),  model, title_tensor, id_to_index)
+            #k10_drop   = run_eval(pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_k10.pkl"),   model, title_tensor, id_to_index)
+            #swap_drift = run_eval(pd.read_pickle(f"evaluation_{dataset}_{dataset_size}_swap.pkl"),  model, title_tensor, id_to_index)
+            #log_print(f"baseline:{baseline}")
+            #log_print(f"k10_drop:{k10_drop}")
+            #log_print(f"swap_drift:{swap_drift}")
+            #print("Δ nDCG@10 when we truncate:", baseline["ndcg@10"] - k10_drop["ndcg@10"])
+            #print("nDCG@10 under sudden drift (swap):", swap_drift["ndcg@10"])
     set_global_models(models)
     return models, news_df, train_df, tokenizer # todo check train_df or behaviors_df?????
 
@@ -3306,10 +5805,11 @@ def train_meta_from_parquet(
 
     files = sorted(Path(parquet_dir).glob(pattern))
     if base_model_type == "cluster":
-        keep = re.compile(r"^(?:\d+|global)_")
+        #keep = re.compile(r"^(?:\d+|global)_")
+        keep = re.compile(r"^fastformer_(?:\d+)_")
         files = [fp for fp in files if keep.match(fp.stem)]
     if base_model_type == "category":
-        remove = re.compile(r"^(?:\d+)_")
+        remove = re.compile(r"^fastformer_(?:\d+)_")
         files = [fp for fp in files if not remove.match(fp.stem)]
 
     if not files:
@@ -3442,7 +5942,343 @@ def gpu_predict_in_batches(model, X, batch=200000):
         out.append(model.predict_proba(part)[:, 1])
     return np.concatenate(out)
 
+def _best_threshold(y_true, y_pred):
+    p, r, t = precision_recall_curve(y_true, y_pred)
+    f1 = 2 * p * r / (p + r + 1e-9)
+    return t[np.argmax(f1)] if len(t) else 0.5
+
+from functools import reduce
+
+import time, json, numpy as np, pandas as pd
+from pathlib import Path
+from functools import reduce
+from sklearn.metrics import (roc_auc_score, average_precision_score,
+                             precision_recall_fscore_support)
+import joblib
+import time, pyarrow.dataset as ds
+import pyarrow.parquet as pq
+
+def fast_stack(files):
+    """
+    Read N parquet files that all share identical row_id order
+    and return one merged DataFrame [row_id, y_true, ImpressionID, pred_*].
+    Much faster than N-way joins.
+    """
+    # ---------- read first file (labels once) ----------
+    print(f"files:{files}")
+    first = files[0]
+    tbl   = pq.read_table(first, columns=["row_id",
+                                          "y_true",
+                                          "ImpressionID",
+                                          "y_pred"])
+    df    = tbl.to_pandas()
+    df.rename(columns={"y_pred": f"pred_{first.stem}"}, inplace=True)
+
+    # ---------- pre-allocate numpy block for remaining preds ----------
+    n_rows   = len(df)
+    n_models = len(files) - 1
+    pred_mat = np.empty((n_rows, n_models), dtype="float32")
+    names    = []
+
+    lengths = [(fp, pq.read_metadata(fp).num_rows) for fp in files]
+    print(f"lengths:{lengths}")
+    base_len = lengths[0][1]
+    for fp, n in lengths:
+        if n != base_len:
+            print(f"⚠️  {fp} has {n:,} rows (expected {base_len:,})")
+
+    for j, fp in enumerate(files[1:]):
+        col = pq.read_table(fp, columns=["y_pred"]).column(0)
+        #.to_pandas()
+        #col = col[col.y_pred.notna()]
+        col = col.to_numpy()
+
+        print(f"fp:{fp}")
+        pred_mat[:, j] = col
+        names.append(f"pred_{fp.stem}")
+
+    df[names] = pred_mat      # single vectorised insertion
+    return df
+
 def evaluate_meta_from_parquet(meta_path: str,
+                               parquet_dir: str = "base_preds",
+                               pattern: str = "*.parquet",
+                               base_model_type: str = "all",
+                               store_parquet_path: str = "preds.parquet",
+                               store_metrics_path: str = "metrics.json",
+                               verbose: bool = True,
+                               booster='default',
+                               batches: bool = True,
+                               model_arc_type = "fastformer"):
+
+    overall_start = time.perf_counter()                         # ← added
+    if verbose:
+        print(f"loading meta model from {meta_path}")
+    meta = joblib.load(meta_path)
+    print(f"Path(parquet_dir).glob(pattern):{Path(parquet_dir).glob(pattern)}")
+
+    # ------------------------------------------------------------------ #
+    # 1) locate parquet files                                            #
+    # ------------------------------------------------------------------ #
+    files = sorted(Path(parquet_dir).glob(pattern))
+    if base_model_type == "cluster":
+        files = [fp for fp in files if re.match(r"^fastformer_(?:\d+)_", fp.stem)]
+    elif base_model_type == "category":
+        files = [fp for fp in files if not re.match(r"^fastformer_(?:global|\d+)_", fp.stem)]
+    
+    # REMOVES na as it somehow was not included in meta training set!!
+    #files = [fp for fp in files if not re.match(r"^fastformer_northamerica_", fp.stem)]
+    # REMOVES na!!
+    
+    if not files:
+        raise FileNotFoundError("No parquet files...")
+
+    # ------------------------------------------------------------------ #
+    # 2) fast load & stack (no Python joins)                             #
+    # ------------------------------------------------------------------ #
+    load_start = time.perf_counter()
+    print(f"fast_stack")
+    merged     = fast_stack(files)            # <── NEW
+    load_time  = time.perf_counter() - load_start
+    merge_time = 0.0                          # we skipped the join step
+    print(f"Loaded & stacked {len(files)} files in {load_time:.3f}s")
+    """
+    # ------------------------------------------------------------------ #
+    # 1) locate parquet files & read them                                #
+    # ------------------------------------------------------------------ #
+    files = sorted(Path(parquet_dir).glob(pattern))
+    if base_model_type == "cluster":
+        files = [fp for fp in files if re.match(r"^(?:\d+)_", fp.stem)]
+    elif base_model_type == "category":
+        files = [fp for fp in files if not re.match(r"^(?:\d+)_", fp.stem)]
+    if not files:
+        raise FileNotFoundError(f"No parquet files matching {pattern}")
+    
+    
+    
+    io_start  = time.perf_counter()
+
+    def load_and_prepare(fp, first=False):
+        print(f"loading file:{fp}")
+        # ❶ grab labels & impression ids just once
+        cols = ["row_id", "y_true", "ImpressionID", "y_pred"] if first else ["row_id", "y_pred"]
+        tbl  = ds.dataset(fp).to_table(columns=cols)          # vectorised Arrow reader
+        df   = tbl.to_pandas()
+        df   = df.rename(columns={"y_pred": f"pred_{fp.stem}"})
+        return df.set_index("row_id")
+
+
+    dfs = [load_and_prepare(fp, first=(i == 0))               # ❷
+        for i, fp in enumerate(files)]
+
+    io_time = time.perf_counter() - io_start                  # ← new metric
+    print(f"merging next")
+    # ------------------------------------------------------------------
+    # 2) join all frames on their integer index in a single pass
+    #    (“row_id” is already the index, so join is hash-based & O(n))
+    # ------------------------------------------------------------------
+    merge_start = time.perf_counter()
+    merged = reduce(lambda a, b: a.join(b, how="inner"), dfs) # fast Arrow→Pandas join
+    merge_time  = time.perf_counter() - merge_start           # ← new metric
+    """
+    featcols    = [c for c in merged.columns if c.startswith("pred_")]
+    
+    # split once to NumPy – no additional copies afterwards
+    y_true   = merged.pop("y_true").to_numpy("int8", copy=False)
+    impr_ids = merged.pop("ImpressionID").to_numpy("int64", copy=False)
+    X        = merged[featcols].to_numpy("float32", copy=False)
+    print(f"pred next")
+    # ------------------------------------------------------------------
+    # 3) meta-model / bagging inference with timing
+    # ------------------------------------------------------------------
+    pred_start = time.perf_counter()
+    if batches:
+        y_pred = gpu_predict_in_batches(meta, X, batch=200_000)
+    else:
+        y_pred = meta.predict_proba(X)[:, 1]
+    predict_time = time.perf_counter() - pred_start
+
+    merged["y_pred"] = y_pred.astype("float32")
+    print(f"pred end")
+
+    """
+    load_t0 = time.perf_counter()                               # ← added
+    def _load(fp, first=False):
+        print(f"loading file:{fp}")
+        cols = ["row_id", "y_true", "y_pred", "ImpressionID"] if first else ["row_id", "y_pred"]
+        df   = pd.read_parquet(fp, columns=cols)
+        return df.rename(columns={"y_pred": f"pred_{fp.stem}"}).set_index("row_id")
+    dfs = [_load(fp, first=(i == 0)) for i, fp in enumerate(files)]
+    load_time = time.perf_counter() - load_t0                   # ← added
+
+    # ------------------------------------------------------------------ #
+    # 2) merge all base-model predictions                                #
+    # ------------------------------------------------------------------ #
+    merge_t0 = time.perf_counter()                              # ← added
+    merged = reduce(lambda l, r: l.join(r, how="inner"), dfs)
+    merge_time = time.perf_counter() - merge_t0                 # ← added
+
+    y_true   = merged.pop("y_true").to_numpy("int8")
+    impr_ids = merged.pop("ImpressionID").to_numpy("int64")
+    featcols = merged.columns.tolist()
+    X        = merged.to_numpy("float32")
+
+    # ------------------------------------------------------------------ #
+    # 3) meta-model inference                                            #
+    # ------------------------------------------------------------------ #
+    pred_t0 = time.perf_counter()                               # ← added
+    if batches:
+        y_pred = gpu_predict_in_batches(meta, X, batch=200_000)
+    else:
+        y_pred = meta.predict_proba(X)[:, 1]
+    predict_time = time.perf_counter() - pred_t0                # ← added
+
+    # attach predictions
+    merged["y_pred"] = y_pred.astype("float32")
+    """
+    # ------------------------------------------------------------------ #
+    # 4) compute meta-model metrics                                      #
+    # ------------------------------------------------------------------ #
+    auc  = roc_auc_score(y_true, y_pred)
+    ap   = average_precision_score(y_true, y_pred)
+    thr  = _best_threshold(y_true, y_pred)
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, (y_pred >= thr).astype(int), average="binary", zero_division=0)
+    n_samples = len(y_true)
+    metrics = {
+        "samples": len(y_true),
+        "AUC":      float(auc),
+        "AP":       float(ap),
+        "precision":float(p),
+        "recall":   float(r),
+        "F1":       float(f1),
+        "threshold":float(thr),
+        "load_time_s":    load_time,
+        "merge_time_s":   merge_time,
+        "predict_time_s": predict_time,
+        "n_samples"        : n_samples,
+        "load_ms"          : load_time   * 1e3,
+        "merge_ms"         : merge_time  * 1e3,
+        "predict_ms"       : predict_time* 1e3,
+        "total_ms"         : (load_time + merge_time + predict_time) * 1e3,
+        "throughput_rows_s": n_samples / (load_time + merge_time + predict_time)
+    }
+
+    # ------------------------------------------------------------------ #
+    # 5) BAGGING ensemble  (unchanged from your earlier code)            #
+    # ------------------------------------------------------------------ #
+    pred_start = time.perf_counter()
+    bagging_pred = merged[featcols].mean(axis=1).to_numpy("float32")
+    predict_time = time.perf_counter() - pred_start
+    bag_auc  = roc_auc_score(y_true, bagging_pred)
+    bag_ap   = average_precision_score(y_true, bagging_pred)
+    bag_thr  = _best_threshold(y_true, bagging_pred)
+    bag_p, bag_r, bag_f1, _ = precision_recall_fscore_support(
+        y_true, (bagging_pred >= bag_thr).astype(int),
+        average="binary", zero_division=0)
+
+    bag_metrics = {
+        "AUC":       float(bag_auc),
+        "AP":        float(bag_ap),
+        "precision": float(bag_p),
+        "recall":    float(bag_r),
+        "F1":        float(bag_f1),
+        "threshold": float(bag_thr),
+        "n_samples"        : n_samples,
+        "load_ms"          : load_time   * 1e3,
+        "merge_ms"         : merge_time  * 1e3,
+        "predict_ms"       : predict_time* 1e3,
+        "total_ms"         : (load_time + merge_time + predict_time) * 1e3,
+        "throughput_rows_s": n_samples / (load_time + merge_time + predict_time)
+    }
+    #metrics.update(bag_metrics)                                # ← keep both sets together
+
+    # ------------------------------------------------------------------ #
+    # 6) write parquet & metrics                                         #
+    # ------------------------------------------------------------------ #
+    write_t0 = time.perf_counter()                              # ← added
+    out_df = pd.DataFrame({
+        "row_id":       np.arange(len(y_true), dtype="int64"),
+        "ImpressionID": impr_ids,
+        "y_true":       y_true,
+        "y_pred":       y_pred
+    })
+    Path(store_parquet_path).parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_parquet(store_parquet_path, engine="fastparquet",
+                      compression="snappy", index=False)
+
+    # extra k-metrics
+    metrics.update(
+        evaluate_parquet_scores(store_parquet_path, k_values=[5,10,20,50,100])
+    )
+    with open(store_metrics_path, "w") as fh:
+        json.dump(metrics, fh, indent=2)
+
+    write_time = time.perf_counter() - write_t0                 # ← added
+    metrics["write_time_s"]  = write_time                       # ← added
+    metrics["total_runtime_s"] = time.perf_counter() - overall_start  # ← added
+
+    if verbose:
+        print(json.dumps(metrics, indent=2))
+
+    # write bagging
+    out_path_bag = Path(str(store_parquet_path).replace(".parquet", "_bagging.parquet"))
+    out_path_bag_metrics = Path(str(store_metrics_path).replace(".json", "_bagging.json"))
+
+
+    out_df = pd.DataFrame({
+        "row_id":       np.arange(len(y_true), dtype="int64"),
+        "ImpressionID": impr_ids,
+        "y_true":       y_true,
+        "y_pred":       bagging_pred,
+    })
+    Path(out_path_bag).parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_parquet(out_path_bag, engine="fastparquet",
+                      compression="snappy", index=False)
+
+    # extra k-metrics
+    bag_metrics.update(
+        evaluate_parquet_scores(out_path_bag, k_values=[5,10,20,50,100])
+    )
+    print(f"bag_metrics:{bag_metrics}")
+    with open(out_path_bag_metrics, "w") as fh:
+        json.dump(bag_metrics, fh, indent=2)
+
+
+    if verbose:
+        print(json.dumps(bag_metrics, indent=2))
+
+    """
+    if verbose:
+        print(json.dumps(bag_metrics, indent=2))
+    with open(out_path_bag_metrics, "w") as file:
+        json.dump(bag_metrics, file, indent=4)
+
+    if store_parquet_path is not None:
+        out_path = Path(out_path_bag)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cols_to_write = ["row_id", "y_true", "y_pred", "ImpressionID"]
+        merged[cols_to_write].to_parquet(
+            out_path,
+            engine="fastparquet",
+            compression="snappy",
+            index=False
+        )
+        if verbose:
+            print(f"wrote meta predictions to {out_path}")
+        bag_metrics_k = evaluate_parquet_scores(out_path, k_values=[5,10,20,50,100])
+        bag_metrics = {**bag_metrics, **bag_metrics_k}
+        print(json.dumps(bag_metrics, indent=2))
+        with open(out_path_bag_metrics, "w") as file:
+            json.dump(bag_metrics, file, indent=4)
+    """
+
+
+    return metrics
+
+
+def evaluate_meta_from_parquet2(meta_path: str,
                                 parquet_dir: str = "base_preds",
                                 pattern: str = "*.parquet",
                                 base_model_type = "all",
@@ -3463,7 +6299,8 @@ def evaluate_meta_from_parquet(meta_path: str,
 
     files = sorted(Path(parquet_dir).glob(pattern))
     if base_model_type == "cluster":
-        keep = re.compile(r"^(?:\d+|global)_")
+        #keep = re.compile(r"^(?:\d+|global)_")
+        keep = re.compile(r"^(?:\d+)_")
         files = [fp for fp in files if keep.match(fp.stem)]
     if base_model_type == "category":
         remove = re.compile(r"^(?:\d+)_")
@@ -3472,18 +6309,35 @@ def evaluate_meta_from_parquet(meta_path: str,
         raise FileNotFoundError(f"No parquet files matching {pattern}")
 
     print(f"base files:{files}")
+    """
     merged   = None
     featcols = []
 
     for fp in files:
-        df  = pd.read_parquet(fp)
+        #print(f"reading file:{fp}")
+        #df  = pd.read_parquet(fp)
+        cols = ["row_id", "y_true", "y_pred", "ImpressionID"]
+        print(f"reading cols: {cols} from file:{fp}")
+        #use_cols = cols if merged is None else ["row_id", "y_pred", "ImpressionID"]
+        df = pd.read_parquet(fp, columns=cols)
+        print(f"df.columns:{df.columns}")
         col = f"pred_{fp.stem}"
         df  = df.rename(columns={"y_pred": col})
         featcols.append(col)
 
-        key_cols = ["row_id", "y_true"] if "row_id" in df.columns else ["y_true"]
-        merged   = df[key_cols + [col]] if merged is None \
-                   else merged.merge(df[key_cols + [col]], on=key_cols, how="inner")
+        key_cols = ["row_id", "y_true"]
+        if "ImpressionID" in df.columns:
+            key_cols.append("ImpressionID")
+        #merged = df[key_cols + [col]] if merged is None \
+        #           else merged.merge(df[key_cols + [col]], on=key_cols, how="inner")
+        if merged is None:
+            merged = df[key_cols + [col]].copy()
+        else:
+            merged = merged.merge(
+                df[['row_id', col]],
+                on='row_id',
+                how='inner'
+            )
 
     if "row_id" not in merged.columns:
         merged.insert(0, "row_id", np.arange(len(merged), dtype="int64"))
@@ -3497,11 +6351,39 @@ def evaluate_meta_from_parquet(meta_path: str,
         y_pred = meta.predict_proba(X)[:, 1]
 
     merged["y_pred"] = y_pred.astype("float32")
+    """
 
-    auc  = roc_auc_score(y_true, y_pred)
-    ap   = average_precision_score(y_true, y_pred)
+    def load_and_prepare(fp, first=False):
+        # on the very first file read impression too
+        cols = ["row_id", "y_true", "y_pred", "ImpressionID"] if first \
+            else ["row_id", "y_pred"]
+        df = pd.read_parquet(fp, columns=cols)
+        # rename the prediction column
+        df = df.rename(columns={"y_pred": f"pred_{fp.stem}"})
+        # set row_id as index so joins stay fast
+        df = df.set_index("row_id")
+        return df
+
+    dfs = [ load_and_prepare(fp, first=(i==0))
+            for i, fp in enumerate(files) ]
+
+    # 2) join them all on row_id
+    merged = reduce(lambda left, right: left.join(right, how="inner"), dfs)
+
+    # 3) pull out arrays and column list
+    y_true       = merged.pop("y_true").to_numpy(dtype="int8")
+    impr_ids     = merged.pop("ImpressionID").to_numpy(dtype="int64")
+    featcols     = merged.columns.tolist()
+    X            = merged.to_numpy(dtype="float32")
+
+
+
+    auc = roc_auc_score(y_true, y_pred)
+    ap = average_precision_score(y_true, y_pred)
+    thr = _best_threshold(y_true, y_pred)
+    print(f"_best_threshold:{thr}")
     p, r, f1, _ = precision_recall_fscore_support(
-        y_true, (y_pred >= 0.5).astype(int), average="binary", zero_division=0)
+        y_true, (y_pred >= thr).astype(int), average="binary", zero_division=0)
 
     metrics = {
         "samples":   int(len(y_true)),
@@ -3521,13 +6403,30 @@ def evaluate_meta_from_parquet(meta_path: str,
         out_path = Path(store_parquet_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cols_to_write = ["row_id", "y_true", "y_pred"]
+        """
+        cols_to_write = ["row_id", "y_true", "y_pred", "ImpressionID"]
         merged[cols_to_write].to_parquet(
             out_path,
             engine="fastparquet",
             compression="snappy",
             index=False
         )
+        """
+
+        out = pd.DataFrame({
+        "row_id":      np.arange(len(y_true), dtype="int64"),
+        "ImpressionID": impr_ids,
+        "y_true":      y_true,
+        "y_pred":      y_pred  # from your meta.predict step
+        })
+        out.to_parquet(
+            out_path,
+            engine="fastparquet",
+            compression="snappy",
+            index=False
+        )
+
+
         if verbose:
             print(f"wrote meta predictions to {out_path}")
         metrics_k = evaluate_parquet_scores(out_path, k_values=[5,10,20,50,100])
@@ -3536,6 +6435,52 @@ def evaluate_meta_from_parquet(meta_path: str,
         with open(store_metrics_path, "w") as file:
             json.dump(metrics, file, indent=4)
 
+
+
+    bagging_pred = merged[featcols].mean(axis=1).to_numpy(dtype="float32")
+
+    bag_auc = roc_auc_score(y_true, bagging_pred)
+    bag_ap  = average_precision_score(y_true, bagging_pred)
+    bag_thr = _best_threshold(y_true, bagging_pred)
+    bag_p, bag_r, bag_f1, _ = precision_recall_fscore_support(
+                y_true, (bagging_pred >= bag_thr).astype(int),
+                average="binary", zero_division=0)
+
+    bag_metrics = {
+        "samples": int(len(y_true)),
+        "bagging_AUC":       float(bag_auc),
+        "bagging_AP":        float(bag_ap),
+        "bagging_precision": float(bag_p),
+        "bagging_recall":    float(bag_r),
+        "bagging_F1":        float(bag_f1)
+    }
+
+    out_path_bag = Path(str(store_parquet_path).replace(".parquet", "_bagging.parquet"))
+    out_path_bag_metrics = Path(str(store_metrics_path).replace(".json", "_bagging.json"))
+
+    if verbose:
+        print(json.dumps(bag_metrics, indent=2))
+    with open(out_path_bag_metrics, "w") as file:
+        json.dump(bag_metrics, file, indent=4)
+
+    if store_parquet_path is not None:
+        out_path = Path(out_path_bag)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cols_to_write = ["row_id", "y_true", "y_pred", "ImpressionID"]
+        merged[cols_to_write].to_parquet(
+            out_path,
+            engine="fastparquet",
+            compression="snappy",
+            index=False
+        )
+        if verbose:
+            print(f"wrote meta predictions to {out_path}")
+        bag_metrics_k = evaluate_parquet_scores(out_path, k_values=[5,10,20,50,100])
+        bag_metrics = {**bag_metrics, **bag_metrics_k}
+        print(json.dumps(bag_metrics, indent=2))
+        with open(out_path_bag_metrics, "w") as file:
+            json.dump(bag_metrics, file, indent=4)
     return metrics
 
 from collections import defaultdict
@@ -3559,6 +6504,8 @@ class RankingMetricsTracker:
         return (precisions * rels_k).sum() / rels_k.sum()
 
     def update(self, y_true, y_score):
+        if y_true.size < 2: # Need at least 2 rows for ordering
+            return
         y_true  = np.asarray(y_true,  dtype=int)
         y_score = np.asarray(y_score, dtype=float)
 
@@ -3588,7 +6535,7 @@ class RankingMetricsTracker:
     def result(self):
         metrics = {}
         for k in self.k_values:
-            if self.num_users == 0:     # guard against div/0
+            if self.num_users == 0:
                 continue
             precision = self.hits[k] / (self.num_users * k)
             recall    = self.hits[k] / self.recalls[k]
@@ -3600,15 +6547,17 @@ class RankingMetricsTracker:
                           "ndcg":      ndcg}
         return metrics
 
-def evaluate_parquet_scores(parquet_path, k_values = (5, 10, 20, 50)):
+def evaluate_parquet_scores(parquet_path, k_values = (5, 10, 20, 50), key="ImpressionID"):
     # Computes ranking metrics from a saved .parquet prediction file.
     # The file must row_id, y_true and y_pred columns
 
     df = pd.read_parquet(parquet_path)
-
+    print(f"parquet file: {parquet_path}, columns: {df.columns.tolist()}")
     # If grouped by user
-    group_key = "user_id" if "user_id" in df.columns else None
 
+    group_key = key if key in df.columns else None
+    if group_key != key:
+        log_print(f"key:{key} is not found in columns!!!!!!!!!!!!!!!!!!!\nkey:{key} is not found in columns!!!!!!!!!!!!!!!!!!!\nkey:{key} is not found in columns!!!!!!!!!!!!!!!!!!!\n")
     tracker = RankingMetricsTracker(k_values=k_values)
 
     if group_key:
@@ -3696,7 +6645,6 @@ def combine_csv_files(input_pattern, combined_output_file=None):
     combined_df.to_csv(combined_output_file, index=False)
     print(f"Combined CSV saved as: {combined_output_file}")
     return combined_output_file
-from pathlib import Path
 
 def compute_experiment_summary(csv_files, k_values=[5, 10, 20, 50, 100], auc=False):
     # If a glob pattern is provided, collect all matching files.
@@ -3774,6 +6722,52 @@ def compute_experiment_summary(csv_files, k_values=[5, 10, 20, 50, 100], auc=Fal
     #print(summary_df["file"])
     return summary_df, summary_dict
 
+def build_and_save_title_tensors(
+    news_df,
+    tokenizer,
+    max_title_length: int,
+    out_path: str = "title_tensors.pkl"
+):
+    news_ids = news_df["NewsID"].tolist()
+    titles   = news_df["Title"].fillna("").tolist()
+
+    sequences = tokenizer.texts_to_sequences(titles)
+
+    padded = pad_sequences(
+        sequences,
+        maxlen=max_title_length,
+        padding="post",
+        truncating="post",
+        value=0
+    )
+    id_to_index = {nid: idx for idx, nid in enumerate(news_ids)}
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "news_ids": news_ids,
+            "padded": padded,
+            "id_to_index": id_to_index
+        }, f)
+
+    print(f"Saved {len(news_ids)} title tensors to {out_path}")
+
+def get_title_tensors(dataset, dataset_size, news_df, tokenizer, max_title_length=30, make_new=False):
+    tensors_file = f"{dataset}_{dataset_size}_title_tensors.pkl"
+    log_print(f"tensors_file:{tensors_file}")
+    if make_new or not os.path.exists(tensors_file):
+        build_and_save_title_tensors(
+            news_df=news_df,
+            tokenizer=tokenizer,
+            max_title_length=max_title_length,
+            out_path=tensors_file
+        )
+
+    with open(tensors_file, "rb") as f:
+        data = pickle.load(f)
+    padded = data["padded"]
+    title_tensor = tf.convert_to_tensor(padded, dtype=tf.int32)
+    id_to_index = data["id_to_index"]
+    return title_tensor, id_to_index
+
 def main(dataset='train', process_dfs=False, process_behaviors=False,
         data_dir_train='dataset/train/', data_dir_valid='dataset/valid/',
         zip_file_train="MINDlarge_train.zip", zip_file_valid="MINDlarge_dev.zip",
@@ -3783,11 +6777,14 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
         skip_already_evaluated=False, batch_size=256, retrain_models=[], eval_dataset_size='large',
         ext_data_dir_train='dataset/train/', ext_data_dir_valid='dataset/valid/',
         ext_zip_file_train="MINDlarge_train.zip", ext_zip_file_valid="MINDlarge_dev.zip",n_estimators=300, test_size=0.2, end_after_process=False,
-        use_model_base=False, valid_dataset_size='large'):
+        use_model_base=False, valid_dataset_size='large', use_avg_profile=False, meta_train_dataset='valid', pad_zeros=True, use_full_avg_profile=False, process_valid_sets=False,
+        make_title_tensor=False,eval_frac=1.0, big_tokenizer=False, pivots=[45], ks=[5], reverse=False, tune_threshold=False, regenerate_metrics=False, vers_suffix="_v4", model_arc_type="fastformer",
+        timed=False, use_cpu=False, clear_store=False):
     # Main function to run tests on a given dataset type ('train' or 'valid').
     # It uses the midpoint time as cutoff and then runs evaluations.
     # Choose dataset directory based on parameter.
-    
+    if use_cpu: # Hide gpu
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
     print("wait 4 hours")
     #time.sleep(14400)
     print("wait ended")
@@ -3825,25 +6822,28 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
     if use_full_set:
         if dataset.lower() == 'train':
             train_data = behaviors_df
-            test_data = {}
+            test_data = pd.DataFrame([{}])
         elif dataset.lower() == 'valid':
             test_data = behaviors_df
-            train_data = {}
+            train_data = pd.DataFrame([{}])
     else:
         train_data, test_data = train_test_split_time(behaviors_df, cutoff_time_str)
 
     if model_type == "cluster":
         models_dict, news_df, behaviors_df, tokenizer = get_models(process_dfs, process_behaviors, data_dir_train, data_dir_valid, zip_file_train, zip_file_valid, evaluate=eval_separate, dataset=dataset,
-        skip_already_evaluated=skip_already_evaluated, model_size=model_size, batch_size=batch_size, retrain_models=retrain_models, dataset_size=dataset_size, test_data=test_data,
-        cutoff_time_str=cutoff_time_str, eval_full=use_full_eval_separate_set, test_size=test_size, use_model_base=use_model_base)
+        skip_already_evaluated=skip_already_evaluated, model_size=model_size, batch_size=batch_size, retrain_models=retrain_models, dataset_size=dataset_size,
+        cutoff_time_str=cutoff_time_str, eval_full=use_full_eval_separate_set, test_size=test_size, use_model_base=use_model_base, process_valid_sets=process_valid_sets, make_title_tensor=make_title_tensor,
+        eval_frac=eval_frac, big_tokenizer=big_tokenizer, pivots=pivots, ks=ks, reverse=reverse, tune_threshold=tune_threshold, regenerate_metrics=regenerate_metrics, vers_suffix=vers_suffix, model_arc_type=model_arc_type,
+        timed=timed, use_cpu=use_cpu, clear_store=clear_store)
     if model_type == "category" or model_type == "all" or model_type == "global":
         models_dict, news_df, behaviors_df, tokenizer = get_models(process_dfs, process_behaviors, data_dir_train, data_dir_valid, zip_file_train, zip_file_valid, model_type=model_type, dataset_size=dataset_size,
         model_size=model_size, load_best_model=load_best_model, load_best_models=load_best_models, epochs=epochs, evaluate=eval_separate, dataset=dataset,
         skip_already_evaluated=skip_already_evaluated, batch_size=batch_size, retrain_models=retrain_models, cutoff_time_str=cutoff_time_str, eval_full=use_full_eval_separate_set, test_size=test_size,
-        use_model_base=use_model_base)
-    if end_after_process:
-        log_print(f"ending after preprocessing")
-        return
+        use_model_base=use_model_base, process_valid_sets=process_valid_sets, make_title_tensor=make_title_tensor, eval_frac=eval_frac, big_tokenizer=big_tokenizer, pivots=pivots, ks=ks, reverse=reverse,
+        tune_threshold=tune_threshold, regenerate_metrics=regenerate_metrics, vers_suffix=vers_suffix, model_arc_type=model_arc_type, timed=timed, use_cpu=use_cpu, clear_store=clear_store)
+    #if end_after_process:
+    log_print(f"ending")
+    return
     print(f"get_models give badd behaviors_df!!")
     print(f"behaviors_df:{behaviors_df}")
     news_df, behaviors_df = init_dataset(data_dir)
@@ -3872,8 +6872,8 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
         cluster_mapping = {"ALL_USERS": all_users}
 
     meta_name = f"XGBClassifier_hist_{n_estimators}"
-    meta_model_base = f"meta_model_{meta_name}_{model_type}_{model_size}_train_{dataset_size}"
-    meta_model_base_pattern = f"meta_model_{meta_name}_*_{model_size}_train_{dataset_size}"
+    meta_model_base = f"meta_model_{meta_name}_{model_type}_{model_size}_{meta_train_dataset}_{dataset_size}"
+    meta_model_base_pattern = f"meta_model_{meta_name}_*_{model_size}_{meta_train_dataset}_{dataset_size}"
     if test_size >= 0.0:
         meta_model_base = f"meta_model_{meta_name}_{model_type}_{model_size}_train_{dataset_size}_test_size_{test_size}"
         meta_model_base_pattern = f"meta_model_{meta_name}_*_{model_size}_train_{dataset_size}_test_size_{test_size}"
@@ -3893,7 +6893,7 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
         ext_model_type = f"{model_type}_best_model"
 
     filename = f"global_average_profile_{dataset_size}.pkl"
-    if os.path.exists(filename):
+    if os.path.exists(filename) and use_avg_profile:
         with open(filename, "rb") as f:
             avg_profile = pickle.load(f)
         print(f"Loaded global average profile from file:{avg_profile}")
@@ -3921,20 +6921,7 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
     with open(profiles_file, "rb") as f:
         user_profiles = pickle.load(f)
     
-    tensors_file = f"{dataset}_{dataset_size}_title_tensors.pkl"
-    if not os.path.exists(tensors_file):
-        build_and_save_title_tensors(
-            news_df=news_df,
-            tokenizer=tokenizer,
-            max_title_length=30,
-            out_path=tensors_file
-        )
-
-    with open(tensors_file, "rb") as f:
-        data = pickle.load(f)
-    padded = data["padded"]
-    title_tensor = tf.convert_to_tensor(padded, dtype=tf.int32)
-    id_to_index = data["id_to_index"]
+    title_tensor, id_to_index = get_title_tensors(dataset, dataset_size, news_df, tokenizer, make_new=make_title_tensor)
     #meta_model_XGBClassifier_hist_cluster_small_train_small
     meta_model_path = f"meta/{meta_model_base}.joblib"
     meta_model_pattern = f"meta/{meta_model_base_pattern}.joblib"
@@ -4005,7 +6992,9 @@ def main(dataset='train', process_dfs=False, process_behaviors=False,
         id_to_index=id_to_index,
         title_tensor=title_tensor,
         meta_model_path=meta_model_path,
-        meta_model_pattern=meta_model_pattern
+        meta_model_pattern=meta_model_pattern,
+        pad_zeros=pad_zeros,
+        use_full_avg_profile=use_full_avg_profile
     )
     
     print("Evaluation complete. Intermediate results were written during testing.")

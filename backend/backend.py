@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 
 app = FastAPI(title="News Recommendation API")
 
+# Configure CORS (allow all origins)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,16 +33,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global variables for data and models
 user_profiles = {}
 tfidf_matrix = None
 fastformer_user_profiles = {}
 
+# PyTorch fastformer model (for fastformer method)
 pt_model = None
 
+# ---------------------------
+# Dummy Preprocessing Function
+# ---------------------------
 def tokenize_input(input_text: str):
+    """
+    Dummy preprocessing to transform raw input text into the 
+    required input shape for Keras ensemble models.
+    Replace this with your actual text preprocessing.
+    """
     return np.array([[len(input_text), 1]])
 
-# Load Models and Data
+# ---------------------------
+# Startup: Load Models and Data
+# ---------------------------
 @app.on_event("startup")
 def load_model_data():
     global user_profiles, tfidf_matrix, fastformer_user_profiles, news_df, behaviors_df, tokenizer, models_dict
@@ -73,7 +86,9 @@ def load_model_data():
         print(f"Failed to load model data: {e}")
         raise e
 
+# ---------------------------
 # Endpoints
+# ---------------------------
 @app.get("/")
 async def root():
     return {"message": "Recommendations available at /recommendations/<user_id>"}
@@ -120,6 +135,7 @@ async def get_recommendations(
             )
             print(f"Stage 1: {len(candidate_ids)} candidates generated.")
 
+            # Optionally, store candidate details from Stage 1 for analysis.
             stage1_results = [{"NewsID": cid, "Title": news_df.loc[news_df['NewsID'] == cid, 'Title'].values[0]} for cid in candidate_ids]
             
             # STAGE 2: RANKING AND STAGE 3: ENSEMBLE AGGREGATION
@@ -167,6 +183,7 @@ async def get_recommendations(
                 })
                 print(f"Candidate {idx}: NewsID={cand_id}, Title='{cand_title}', Score={score}")
 
+            # Compute statistics on Stage 2 scores
             candidate_scores = scores_arr = np.array(candidate_scores).flatten()
             print("Stage 2 Score Statistics:", {
                 "min": scores_arr.min(),
@@ -186,8 +203,12 @@ async def get_recommendations(
             plt.ylabel("Number of Candidates")
             plt.title("Histogram of Stage 2 Prediction Scores")
             plt.show()
+            # Optionally, save the figure:
             plt.savefig("stage2_score_histogram.png")
-            final_scores = scores_arr
+            # Stage 3: Ensemble Aggregation (if using multiple ensemble methods, compare their output)
+            # Here, we assume ensemble_bagging is the chosen method.
+            # If you want to test multiple methods, you can compute their scores and compare.
+            final_scores = scores_arr  # For simplicity, we use the bagging result as final.
             top_indices = np.argsort(final_scores)[-top_n:][::-1]
             final_debug_info = [candidate_debug_info[i] for i in top_indices]
             print("Stage 3: Top candidates after ensemble aggregation:")
@@ -197,6 +218,7 @@ async def get_recommendations(
         elif method.lower() == "fastformer":
             if user_id not in fastformer_user_profiles:
                 raise HTTPException(status_code=404, detail="Fastformer user profile not found")
+            # Use the PyTorch model for fastformer-based recommendations.
             user_vector = fastformer_user_profiles[user_id]
             user_vector = np.asarray(user_vector)
             log_ids = torch.LongTensor([user_vector]).to('cpu')
@@ -216,6 +238,7 @@ async def get_recommendations(
             similarities = cosine_similarity(user_vector, tfidf_matrix)
             recommended_indices = similarities.argsort()[0][-5:][::-1]
         
+        # Retrieve article details from news_df using recommended_indices.
         if method.lower() in ["bagging", "boosting", "stacking", "hybrid"]:
             recommended_ids = [candidate_ids[i] for i in recommended_indices]
             recommended_articles = news_df[news_df['NewsID'].isin(recommended_ids)][['Title', 'Abstract']].fillna("").to_dict(orient='records')
